@@ -19,6 +19,7 @@ This serves both frontend and API at `http://localhost:8010`. Check `http://loca
 ## Database resources
 
 - [ER diagram and data dictionary](docs/ER_DIAGRAM.md)
+- [Public demo deployment](docs/RENDER_DEPLOYMENT.md)
 - [Project reports](docs/reports/)
 - [Original diagrams](docs/diagrams/)
 - MySQL schema: `database/schema.mysql.sql`

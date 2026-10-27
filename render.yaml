@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: casework-demo
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python backend/hosted_start.py
+    healthCheckPath: /api/health
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: CASEWORK_DB
+        value: sqlite
+      - key: CASEWORK_NEW_USER
+        value: casework_admin
+      - key: CASEWORK_NEW_NAME
+        value: Casework Administrator
+      - key: CASEWORK_NEW_ROLE
+        value: Management Head
+      - key: CASEWORK_NEW_PASSWORD
+        sync: false
+      - key: COOKIE_SECURE
+        value: "1"
