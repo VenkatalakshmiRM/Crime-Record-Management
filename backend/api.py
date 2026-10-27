@@ -529,8 +529,11 @@ class API(BaseHTTPRequestHandler):
             except Exception:c.rollback();raise
             finally:c.close()
         role=b.get('role');active=b.get('active')
-        if role is None and active is None:return 400,{'error':'Provide a role or active state to update.'},{ }
+        name=clean_text(b,'name','Name',160) if 'name' in b else None
+        username=clean_text(b,'username','Username',80).lower() if 'username' in b else None
+        if role is None and active is None and name is None and username is None:return 400,{'error':'Provide account details, a role, or an active state to update.'},{ }
         if role is not None and role not in ROLES:raise ValueError('Unsupported account role.')
+        if username is not None and not re.fullmatch(r'[a-z0-9._-]+',username):raise ValueError('Username may contain lowercase letters, numbers, periods, underscores, and hyphens.')
         if active is not None:
             if isinstance(active,bool):active_value=active
             elif active in (0,1,'0','1'):active_value=bool(int(active))
@@ -539,16 +542,19 @@ class API(BaseHTTPRequestHandler):
         try:
             cur=c.cursor();cur.execute(sql('SELECT id,username,name,role,active,created_at FROM users WHERE id=?'),(uid,));existing=one_dict(cur)
             if not existing:return 404,{'error':'User account was not found.'},{ }
-            next_role=role or existing['role'];next_active=active_value if active is not None else bool(existing['active'])
+            next_role=role or existing['role'];next_active=active_value if active is not None else bool(existing['active']);next_name=name if name is not None else existing['name'];next_username=username if username is not None else existing['username']
+            if next_username!=existing['username']:
+                cur.execute(sql('SELECT id FROM users WHERE username=? AND id<>?'),(next_username,uid))
+                if one_dict(cur):return 409,{'error':'That username is already in use.'},{ }
             if uid==user['id'] and not next_active:return 409,{'error':'You cannot disable your own Management Head account.'},{ }
             if uid==user['id'] and next_role!='Management Head':return 409,{'error':'You cannot change your own Management Head role.'},{ }
             if existing['role']=='Management Head' and bool(existing['active']) and (next_role!='Management Head' or not next_active):
                 cur.execute("SELECT COUNT(*) n FROM users WHERE role='Management Head' AND active=1");heads=int(one_dict(cur)['n'] or 0)
                 if heads<=1:return 409,{'error':'At least one active Management Head account must remain.'},{ }
-            changed=next_role!=existing['role'] or next_active!=bool(existing['active'])
-            cur.execute(sql('UPDATE users SET role=?,active=? WHERE id=?'),(next_role,next_active,uid))
-            if changed:cur.execute(sql('DELETE FROM sessions WHERE user_id=?'),(uid,))
-            activity(c,'updated','user',existing['username'],'Updated account role or access state',user['username']);c.commit();existing['role']=next_role;existing['active']=next_active;return 200,{'item':existing},{ }
+            changed=next_role!=existing['role'] or next_active!=bool(existing['active']) or next_name!=existing['name'] or next_username!=existing['username']
+            cur.execute(sql('UPDATE users SET username=?,name=?,role=?,active=? WHERE id=?'),(next_username,next_name,next_role,next_active,uid))
+            if changed and uid!=user['id']:cur.execute(sql('DELETE FROM sessions WHERE user_id=?'),(uid,))
+            activity(c,'updated','user',next_username,'Updated user account details or access',user['username']);c.commit();existing['username']=next_username;existing['name']=next_name;existing['role']=next_role;existing['active']=next_active;return 200,{'item':existing},{ }
         except Exception:c.rollback();raise
         finally:c.close()
     def list_cases(self,q,user):
