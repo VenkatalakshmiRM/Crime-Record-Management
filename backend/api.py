@@ -28,6 +28,19 @@ HEARING_STATUS={'Scheduled','Completed','Adjourned','Cancelled'}
 _lock=threading.RLock(); _sessions={}; _actor_context=threading.local()
 
 def utcnow(): return datetime.now(timezone.utc).isoformat(timespec='seconds')
+def validate_date(value,label,not_future=False):
+    try:
+        parsed=date.fromisoformat(value)
+        if parsed.isoformat()!=value:raise ValueError()
+    except (TypeError,ValueError):raise ValueError(f'{label} must use YYYY-MM-DD format.')
+    if not_future and parsed>date.today():raise ValueError(f'{label} cannot be in the future.')
+    return parsed
+def parse_age(value):
+    if value in (None,'','—'):return None
+    if isinstance(value,bool) or not re.fullmatch(r'\d{1,3}',str(value).strip()):raise ValueError('Age must be a whole number between 0 and 120.')
+    age=int(value)
+    if not 0<=age<=120:raise ValueError('Age must be between 0 and 120.')
+    return age
 def hash_password(password, salt=None):
     salt=salt or secrets.token_bytes(16)
     return salt.hex()+':'+hashlib.pbkdf2_hmac('sha256',password.encode(),salt,240000).hex()
@@ -99,20 +112,39 @@ def init_db():
         person_status="ENUM('Under investigation','In custody','Released on bail','Wanted','Unknown')" if mysql else "VARCHAR(60) CHECK(status IN ('Under investigation','In custody','Released on bail','Wanted','Unknown'))"
         user_role="ENUM('Administrator','Management Head','Operator')" if mysql else "VARCHAR(40) CHECK(role IN ('Administrator','Management Head','Operator'))"
         statements=[
-        f'''CREATE TABLE IF NOT EXISTS officers(id {auto},name VARCHAR(160) NOT NULL,role VARCHAR(120) NOT NULL,badge VARCHAR(80) NOT NULL UNIQUE,created_at VARCHAR(40) NOT NULL,updated_at VARCHAR(40) NOT NULL)''',
+        f'''CREATE TABLE IF NOT EXISTS teams(id {auto},name VARCHAR(160) NOT NULL UNIQUE,description VARCHAR(500) NULL,created_at VARCHAR(40) NOT NULL,updated_at VARCHAR(40) NOT NULL)''',
+        f'''CREATE TABLE IF NOT EXISTS officers(id {auto},name VARCHAR(160) NOT NULL,role VARCHAR(120) NOT NULL,badge VARCHAR(80) NOT NULL UNIQUE,team_id INTEGER NULL,user_id INTEGER NULL,created_at VARCHAR(40) NOT NULL,updated_at VARCHAR(40) NOT NULL,FOREIGN KEY(team_id) REFERENCES teams(id) ON DELETE SET NULL,FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL)''',
         f'''CREATE TABLE IF NOT EXISTS users(id {auto},username VARCHAR(80) NOT NULL UNIQUE,password_hash VARCHAR(200) NOT NULL,name VARCHAR(160) NOT NULL,role {user_role} NOT NULL,active BOOLEAN NOT NULL DEFAULT TRUE,created_at VARCHAR(40) NOT NULL)''',
-        f'''CREATE TABLE IF NOT EXISTS cases(id {auto},case_ref VARCHAR(80) NOT NULL UNIQUE,title VARCHAR(240) NOT NULL,category VARCHAR(100) NOT NULL,status {case_status} NOT NULL,officer_id INTEGER NULL,opened_on DATE NULL,location VARCHAR(240) NOT NULL DEFAULT '',resolution TEXT NULL,created_at VARCHAR(40) NOT NULL,updated_at VARCHAR(40) NOT NULL,FOREIGN KEY(officer_id) REFERENCES officers(id) ON DELETE SET NULL)''',
+        f'''CREATE TABLE IF NOT EXISTS officer_requests(id {auto},name VARCHAR(160) NOT NULL,role VARCHAR(120) NOT NULL,badge VARCHAR(80) NOT NULL,team_id INTEGER NULL,username VARCHAR(80) NOT NULL,requested_by INTEGER NOT NULL,status VARCHAR(20) NOT NULL DEFAULT 'Pending',reviewed_by INTEGER NULL,created_at VARCHAR(40) NOT NULL,FOREIGN KEY(team_id) REFERENCES teams(id) ON DELETE SET NULL,FOREIGN KEY(requested_by) REFERENCES users(id),FOREIGN KEY(reviewed_by) REFERENCES users(id))''',
+        f'''CREATE TABLE IF NOT EXISTS cases(id {auto},case_ref VARCHAR(80) NOT NULL UNIQUE,title VARCHAR(240) NOT NULL,category VARCHAR(100) NOT NULL,status {case_status} NOT NULL,officer_id INTEGER NULL,opened_on DATE NOT NULL,location VARCHAR(240) NOT NULL CHECK(length(trim(location))>0),resolution TEXT NULL,created_at VARCHAR(40) NOT NULL,updated_at VARCHAR(40) NOT NULL,FOREIGN KEY(officer_id) REFERENCES officers(id) ON DELETE SET NULL)''',
+        f'''CREATE TABLE IF NOT EXISTS case_members(case_id INTEGER NOT NULL,officer_id INTEGER NOT NULL,assigned_at VARCHAR(40) NOT NULL,PRIMARY KEY(case_id,officer_id),FOREIGN KEY(case_id) REFERENCES cases(id) ON DELETE CASCADE,FOREIGN KEY(officer_id) REFERENCES officers(id) ON DELETE CASCADE)''',
+        f'''CREATE TABLE IF NOT EXISTS case_teams(case_id INTEGER NOT NULL,team_id INTEGER NOT NULL,assigned_at VARCHAR(40) NOT NULL,PRIMARY KEY(case_id,team_id),FOREIGN KEY(case_id) REFERENCES cases(id) ON DELETE CASCADE,FOREIGN KEY(team_id) REFERENCES teams(id) ON DELETE CASCADE)''',
         f'''CREATE TABLE IF NOT EXISTS persons(id {auto},name VARCHAR(160) NOT NULL,case_id INTEGER NULL,age INTEGER NULL CHECK(age IS NULL OR age BETWEEN 0 AND 120),status {person_status} NOT NULL,charge VARCHAR(240) NOT NULL,created_at VARCHAR(40) NOT NULL,updated_at VARCHAR(40) NOT NULL,FOREIGN KEY(case_id) REFERENCES cases(id) ON DELETE SET NULL)''',
         f'''CREATE TABLE IF NOT EXISTS case_persons(case_reference VARCHAR(80) NOT NULL,person_id INTEGER NOT NULL,role {"ENUM('suspect','witness','victim','person_of_interest')" if mysql else "VARCHAR(32) CHECK(role IN ('suspect','witness','victim','person_of_interest'))"} NOT NULL,added_at VARCHAR(40) NOT NULL,PRIMARY KEY(case_reference,person_id,role),FOREIGN KEY(case_reference) REFERENCES cases(case_ref) ON DELETE CASCADE,FOREIGN KEY(person_id) REFERENCES persons(id) ON DELETE CASCADE)''',
         f'''CREATE TABLE IF NOT EXISTS evidence(id {auto},case_reference VARCHAR(80) NOT NULL,description TEXT NOT NULL,`type` VARCHAR(80) NOT NULL,hash CHAR(64) NOT NULL,storage_path VARCHAR(500) NOT NULL,collected_by INTEGER NOT NULL,collected_at VARCHAR(40) NOT NULL,FOREIGN KEY(case_reference) REFERENCES cases(case_ref) ON DELETE RESTRICT,FOREIGN KEY(collected_by) REFERENCES officers(id) ON DELETE RESTRICT)''',
         f'''CREATE TABLE IF NOT EXISTS custody_log(id {auto},evidence_id INTEGER NOT NULL,from_officer INTEGER NULL,to_officer INTEGER NOT NULL,purpose VARCHAR(500) NOT NULL,transferred_at VARCHAR(40) NOT NULL,FOREIGN KEY(evidence_id) REFERENCES evidence(id) ON DELETE RESTRICT,FOREIGN KEY(from_officer) REFERENCES officers(id) ON DELETE RESTRICT,FOREIGN KEY(to_officer) REFERENCES officers(id) ON DELETE RESTRICT)''',
         f'''CREATE TABLE IF NOT EXISTS hearings(id {auto},case_reference VARCHAR(80) NOT NULL,court VARCHAR(240) NOT NULL,hearing_date DATE NOT NULL,status {"ENUM('Scheduled','Completed','Adjourned','Cancelled')" if mysql else "VARCHAR(24) CHECK(status IN ('Scheduled','Completed','Adjourned','Cancelled'))"} NOT NULL,outcome TEXT NULL,notes TEXT NULL,FOREIGN KEY(case_reference) REFERENCES cases(case_ref) ON DELETE RESTRICT)''',
         f'''CREATE TABLE IF NOT EXISTS activity(id {auto},action VARCHAR(60) NOT NULL,record_type VARCHAR(60) NOT NULL,record_ref VARCHAR(100) NOT NULL,description VARCHAR(300) NOT NULL,actor VARCHAR(80) NULL,created_at VARCHAR(40) NOT NULL)''',
-        f'''CREATE TABLE IF NOT EXISTS audit_log(id {auto},table_name VARCHAR(64) NOT NULL,record_key VARCHAR(80) NOT NULL,action VARCHAR(10) NOT NULL,old_values {'JSON' if mysql else 'TEXT'} NULL,new_values {'JSON' if mysql else 'TEXT'} NULL,changed_by VARCHAR(80) NULL,changed_at VARCHAR(40) NOT NULL)''',
-        f'''CREATE TABLE IF NOT EXISTS case_status_history(id {auto},case_reference VARCHAR(80) NOT NULL,old_status VARCHAR(40) NULL,new_status VARCHAR(40) NULL,changed_by VARCHAR(80) NULL,changed_at VARCHAR(40) NOT NULL)''',
+        f'''CREATE TABLE IF NOT EXISTS case_status_history(id {auto},case_reference VARCHAR(80) NOT NULL,event_type VARCHAR(24) NOT NULL DEFAULT 'STATUS_CHANGED',old_status VARCHAR(40) NULL,new_status VARCHAR(40) NULL,old_values {'JSON' if mysql else 'TEXT'} NULL,new_values {'JSON' if mysql else 'TEXT'} NULL,changed_by VARCHAR(80) NULL,changed_at VARCHAR(40) NOT NULL)''',
         f'''CREATE TABLE IF NOT EXISTS sessions(token_hash VARCHAR(64) PRIMARY KEY,user_id INTEGER NOT NULL,expires_at VARCHAR(40) NOT NULL,last_seen_at VARCHAR(40) NOT NULL,FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)''',
         f'''CREATE TABLE IF NOT EXISTS login_attempts(id {auto},username_key CHAR(64) NOT NULL,ip_key CHAR(64) NOT NULL,attempted_at VARCHAR(40) NOT NULL,succeeded BOOLEAN NOT NULL DEFAULT FALSE,locked_until VARCHAR(40) NULL)''']
         for stmt in statements: cur.execute(stmt)
+        if mysql:
+            cur.execute("ALTER TABLE cases MODIFY location VARCHAR(240) NOT NULL")
+        else:
+            # Existing SQLite tables are guarded by API checks; these insert triggers
+            # extend equivalent protections to direct SQL writes without rebuilding data.
+            for trigger in ('cases_validate_insert','persons_validate_insert','evidence_validate_insert','hearings_validate_insert'):
+                cur.execute(f'DROP TRIGGER IF EXISTS {trigger}')
+            cur.executescript('''
+            CREATE TRIGGER cases_validate_insert BEFORE INSERT ON cases BEGIN
+              SELECT CASE WHEN length(NEW.opened_on)<>10 OR date(NEW.opened_on) IS NULL OR date(NEW.opened_on)<>NEW.opened_on THEN RAISE(ABORT,'Invalid case opened date') END;
+            END;
+            CREATE TRIGGER persons_validate_insert BEFORE INSERT ON persons WHEN NEW.age IS NOT NULL AND (typeof(NEW.age)<>'integer' OR NEW.age<0 OR NEW.age>120) BEGIN SELECT RAISE(ABORT,'Invalid person age'); END;
+            CREATE TRIGGER evidence_validate_insert BEFORE INSERT ON evidence WHEN length(NEW.hash)<>64 OR NEW.hash GLOB '*[^0-9a-fA-F]*' BEGIN SELECT RAISE(ABORT,'Invalid SHA-256 evidence hash'); END;
+            CREATE TRIGGER hearings_validate_insert BEFORE INSERT ON hearings WHEN length(NEW.hearing_date)<>10 OR date(NEW.hearing_date) IS NULL OR (NEW.status='Scheduled' AND date(NEW.hearing_date)<date('now')) BEGIN SELECT RAISE(ABORT,'Invalid hearing date'); END;
+            ''')
+        migrate_case_history(conn,mysql)
         if mysql:
             # Upgrade existing MySQL databases while preserving accounts and password hashes.
             cur.execute("SELECT COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='users' AND COLUMN_NAME='role'")
@@ -159,7 +191,32 @@ def init_db():
             has_resolution=one_dict(cur)
         else:has_resolution=any(row['name']=='resolution' for row in cur.execute('PRAGMA table_info(cases)').fetchall())
         if not has_resolution:cur.execute('ALTER TABLE cases ADD COLUMN resolution TEXT NULL')
-        indexes=['CREATE INDEX idx_cases_status ON cases(status)','CREATE INDEX idx_cases_category ON cases(category)','CREATE INDEX idx_cases_location ON cases(location)','CREATE INDEX idx_cases_status_category_opened ON cases(status,category,opened_on)','CREATE INDEX idx_cases_officer ON cases(officer_id)','CREATE INDEX idx_persons_name ON persons(name)','CREATE INDEX idx_persons_case ON persons(case_id)','CREATE INDEX idx_persons_status ON persons(status)','CREATE INDEX idx_case_persons_person ON case_persons(person_id,case_reference)','CREATE INDEX idx_sessions_user_id ON sessions(user_id)','CREATE INDEX idx_login_attempts_username_time ON login_attempts(username_key,attempted_at)','CREATE INDEX idx_login_attempts_ip_time ON login_attempts(ip_key,attempted_at)','CREATE INDEX idx_evidence_case ON evidence(case_reference,id)','CREATE INDEX idx_evidence_collector ON evidence(collected_by)','CREATE INDEX idx_custody_evidence ON custody_log(evidence_id,id)','CREATE INDEX idx_custody_from_officer ON custody_log(from_officer)','CREATE INDEX idx_custody_to_officer ON custody_log(to_officer)','CREATE INDEX idx_hearings_case ON hearings(case_reference,hearing_date)','CREATE INDEX idx_hearings_date_status ON hearings(hearing_date,status)','CREATE INDEX idx_activity_created ON activity(created_at)','CREATE INDEX idx_audit_record ON audit_log(table_name,record_key,id)','CREATE INDEX idx_case_status_history_ref ON case_status_history(case_reference,id)']
+        # Add relationship fields safely to installations created before teams and linked accounts existed.
+        if mysql:
+            for table,column,ddl in [('officers','team_id','BIGINT UNSIGNED NULL'),('officers','user_id','BIGINT UNSIGNED NULL')]:
+                cur.execute(sql("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=?"),(table,column))
+                if not one_dict(cur):cur.execute(f'ALTER TABLE {table} ADD COLUMN {column} {ddl}')
+        else:
+            cols={r['name'] for r in cur.execute('PRAGMA table_info(officers)').fetchall()}
+            if 'team_id' not in cols:cur.execute('ALTER TABLE officers ADD COLUMN team_id INTEGER NULL REFERENCES teams(id) ON DELETE SET NULL')
+            if 'user_id' not in cols:cur.execute('ALTER TABLE officers ADD COLUMN user_id INTEGER NULL REFERENCES users(id) ON DELETE SET NULL')
+        indexes=['CREATE INDEX idx_cases_status ON cases(status)','CREATE INDEX idx_cases_category ON cases(category)','CREATE INDEX idx_cases_location ON cases(location)','CREATE INDEX idx_cases_status_category_opened ON cases(status,category,opened_on)','CREATE INDEX idx_cases_officer ON cases(officer_id)','CREATE INDEX idx_case_members_officer ON case_members(officer_id,case_id)','CREATE INDEX idx_case_teams_team ON case_teams(team_id,case_id)','CREATE INDEX idx_persons_name ON persons(name)','CREATE INDEX idx_persons_case ON persons(case_id)','CREATE INDEX idx_persons_status ON persons(status)','CREATE INDEX idx_case_persons_person ON case_persons(person_id,case_reference)','CREATE INDEX idx_sessions_user_id ON sessions(user_id)','CREATE INDEX idx_login_attempts_username_time ON login_attempts(username_key,attempted_at)','CREATE INDEX idx_login_attempts_ip_time ON login_attempts(ip_key,attempted_at)','CREATE INDEX idx_evidence_case ON evidence(case_reference,id)','CREATE INDEX idx_evidence_collector ON evidence(collected_by)','CREATE INDEX idx_custody_evidence ON custody_log(evidence_id,id)','CREATE INDEX idx_custody_from_officer ON custody_log(from_officer)','CREATE INDEX idx_custody_to_officer ON custody_log(to_officer)','CREATE INDEX idx_hearings_case ON hearings(case_reference,hearing_date)','CREATE INDEX idx_hearings_date_status ON hearings(hearing_date,status)','CREATE INDEX idx_activity_created ON activity(created_at)','CREATE INDEX idx_case_status_history_ref ON case_status_history(case_reference,id)']
+        cur.execute(sql('SELECT id FROM teams WHERE name=?'),('General',));default_team=one_dict(cur)
+        if not default_team:
+            now=utcnow();cur.execute(sql('INSERT INTO teams(name,description,created_at,updated_at) VALUES(?,?,?,?)'),('General','Existing team members migrated from the original directory.',now,now));default_team={'id':cur.lastrowid}
+        cur.execute('SELECT id FROM officers WHERE team_id IS NULL')
+        for officer in cursor_dicts(cur):cur.execute(sql('UPDATE officers SET team_id=? WHERE id=?'),(default_team['id'],officer['id']))
+        cur.execute('SELECT o.id,o.name,o.badge FROM officers o WHERE o.user_id IS NULL')
+        for officer in cursor_dicts(cur):
+            cur.execute(sql('SELECT u.id FROM users u LEFT JOIN officers linked ON linked.user_id=u.id WHERE LOWER(u.name)=LOWER(?) AND u.role=? AND linked.id IS NULL ORDER BY u.id LIMIT 1'),(officer['name'],'Operator'));existing=one_dict(cur)
+            if existing:uid=existing['id']
+            else:
+                base=re.sub(r'[^a-z0-9._-]+','.',officer['name'].lower()).strip('.') or f'officer{officer["id"]}';username=base;cur.execute(sql('SELECT id FROM users WHERE username=?'),(username,))
+                if one_dict(cur):username=f'{base}.{officer["badge"].lower()}'
+                cur.execute(sql('INSERT INTO users(username,password_hash,name,role,active,created_at) VALUES(?,?,?,?,?,?)'),(username,hash_password(secrets.token_urlsafe(15)),officer['name'],'Operator',True,utcnow()));uid=cur.lastrowid
+            cur.execute(sql('UPDATE officers SET user_id=? WHERE id=?'),(uid,officer['id']))
+        cur.execute('SELECT c.id,c.officer_id,c.created_at FROM cases c LEFT JOIN case_members cm ON cm.case_id=c.id WHERE c.officer_id IS NOT NULL AND cm.case_id IS NULL')
+        for assigned in cursor_dicts(cur):cur.execute(sql('INSERT INTO case_members(case_id,officer_id,assigned_at) VALUES(?,?,?)'),(assigned['id'],assigned['officer_id'],assigned['created_at'] or utcnow()))
         for stmt in indexes:
             try:cur.execute(stmt if mysql else stmt.replace('CREATE INDEX ','CREATE INDEX IF NOT EXISTS '))
             except Exception as e:
@@ -167,32 +224,71 @@ def init_db():
         # Keep old records intact while migrating the deprecated single-case link.
         legacy_insert="INSERT IGNORE INTO case_persons(case_reference,person_id,role,added_at) SELECT c.case_ref,p.id,'person_of_interest',COALESCE(p.created_at,?) FROM persons p JOIN cases c ON c.id=p.case_id WHERE p.case_id IS NOT NULL" if mysql else "INSERT OR IGNORE INTO case_persons(case_reference,person_id,role,added_at) SELECT c.case_ref,p.id,'person_of_interest',COALESCE(p.created_at,?) FROM persons p JOIN cases c ON c.id=p.case_id WHERE p.case_id IS NOT NULL"
         cur.execute(sql(legacy_insert),(utcnow(),))
-        if not mysql:install_sqlite_audit_triggers(cur)
-        else:install_mysql_audit_triggers(cur);install_mysql_routines(cur)
+        if not mysql:install_sqlite_case_history_triggers(cur)
+        else:install_mysql_case_history_triggers(cur);install_mysql_routines(cur)
         conn.commit()
         if not mysql:conn.execute('PRAGMA foreign_keys=ON')
     finally: conn.close()
 
-def install_sqlite_audit_triggers(cur):
+def migrate_case_history(conn,mysql):
+    cur=conn.cursor()
+    if mysql:
+        cur.execute("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='case_status_history'")
+        columns={row['COLUMN_NAME'] for row in cursor_dicts(cur)}
+        for name,definition in (('event_type',"VARCHAR(24) NOT NULL DEFAULT 'STATUS_CHANGED'"),('old_values','JSON NULL'),('new_values','JSON NULL')):
+            if name not in columns:cur.execute(f'ALTER TABLE case_status_history ADD COLUMN {name} {definition}')
+        cur.execute("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='audit_log'")
+        has_audit=bool(one_dict(cur))
+    else:
+        cur.execute('PRAGMA table_info(case_status_history)');columns={row['name'] for row in cursor_dicts(cur)}
+        for name,definition in (('event_type',"TEXT NOT NULL DEFAULT 'STATUS_CHANGED'"),('old_values','TEXT NULL'),('new_values','TEXT NULL')):
+            if name not in columns:cur.execute(f'ALTER TABLE case_status_history ADD COLUMN {name} {definition}')
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='audit_log'");has_audit=bool(one_dict(cur))
+    if has_audit:
+        cur.execute('SELECT table_name,record_key,action,old_values,new_values,changed_by,changed_at FROM audit_log WHERE table_name=? ORDER BY id' if mysql else 'SELECT table_name,record_key,action,old_values,new_values,changed_by,changed_at FROM audit_log WHERE table_name=? ORDER BY id',('cases',))
+        for row in cursor_dicts(cur):
+            def values(value):
+                if isinstance(value,str):
+                    try:return json.loads(value)
+                    except (TypeError,ValueError):return None
+                return value
+            old=values(row['old_values']);new=values(row['new_values']);old_status=(old or {}).get('status');new_status=(new or {}).get('status');action=row['action'].upper();kind={'INSERT':'CASE_CREATED','UPDATE':'CASE_UPDATED','DELETE':'CASE_DELETED'}.get(action,'CASE_UPDATED')
+            if action=='UPDATE' and old_status!=new_status:
+                cur.execute(sql('SELECT id FROM case_status_history WHERE case_reference=? AND old_status=? AND new_status=? AND changed_at=? ORDER BY id DESC LIMIT 1'),(row['record_key'],old_status,new_status,row['changed_at']));existing=one_dict(cur)
+                if existing:cur.execute(sql('UPDATE case_status_history SET event_type=?,old_values=?,new_values=? WHERE id=?'),('STATUS_CHANGED',json.dumps(old) if old is not None else None,json.dumps(new) if new is not None else None,existing['id']))
+                else:cur.execute(sql('INSERT INTO case_status_history(case_reference,event_type,old_status,new_status,old_values,new_values,changed_by,changed_at) VALUES(?,?,?,?,?,?,?,?)'),(row['record_key'],'STATUS_CHANGED',old_status,new_status,json.dumps(old) if old is not None else None,json.dumps(new) if new is not None else None,row['changed_by'],row['changed_at']))
+                continue
+            cur.execute(sql('INSERT INTO case_status_history(case_reference,event_type,old_status,new_status,old_values,new_values,changed_by,changed_at) VALUES(?,?,?,?,?,?,?,?)'),(row['record_key'],kind,None,None,json.dumps(old) if old is not None else None,json.dumps(new) if new is not None else None,row['changed_by'],row['changed_at']))
+        if mysql:
+            for trigger in ('cases_audit_insert','cases_audit_update','cases_audit_delete','cases_status_history_update'):cur.execute(f'DROP TRIGGER IF EXISTS {trigger}')
+            cur.execute('DROP TABLE audit_log')
+        else:
+            for trigger in ('cases_audit_insert','cases_audit_update','cases_audit_delete'):cur.execute(f'DROP TRIGGER IF EXISTS {trigger}')
+            cur.execute('DROP TABLE audit_log')
+
+def install_sqlite_case_history_triggers(cur):
     stamp="strftime('%Y-%m-%dT%H:%M:%fZ','now')"
-    for name in ('cases_audit_insert','cases_audit_update','cases_audit_delete','cases_status_history_update','cases_block_closed_delete','cases_reject_reopen','custody_log_no_update','custody_log_no_delete'):
+    for name in ('cases_audit_insert','cases_audit_update','cases_audit_delete','cases_history_insert','cases_history_update','cases_history_delete','cases_require_fields_insert','cases_require_fields_update','cases_status_history_update','cases_block_closed_delete','cases_reject_reopen','custody_log_no_update','custody_log_no_delete'):
         cur.execute(f'DROP TRIGGER IF EXISTS {name}')
     cur.executescript(f'''
-    CREATE TRIGGER IF NOT EXISTS cases_audit_insert AFTER INSERT ON cases BEGIN
-      INSERT INTO audit_log(table_name,record_key,action,old_values,new_values,changed_by,changed_at)
-      VALUES('cases',NEW.case_ref,'INSERT',NULL,json_object('case_ref',NEW.case_ref,'title',NEW.title,'category',NEW.category,'status',NEW.status,'officer_id',NEW.officer_id,'opened_on',NEW.opened_on,'location',NEW.location,'resolution',NEW.resolution),casework_app_user(),{stamp});
+    CREATE TRIGGER IF NOT EXISTS cases_require_fields_insert BEFORE INSERT ON cases WHEN (NEW.case_ref NOT GLOB 'CASE-[0-9][0-9][0-9][0-9]-[0-9][0-9][0-9]' OR length(NEW.case_ref)<>13) OR length(trim(NEW.title))=0 OR length(trim(NEW.category))=0 OR NEW.opened_on IS NULL OR length(trim(NEW.location))=0 BEGIN
+      SELECT RAISE(ABORT,'CASEWORK_REQUIRED_CASE_FIELDS: Use case ID format CASE-YYYY-NNN and provide title, category, date opened, and location.');
     END;
-    CREATE TRIGGER IF NOT EXISTS cases_audit_update AFTER UPDATE ON cases BEGIN
-      INSERT INTO audit_log(table_name,record_key,action,old_values,new_values,changed_by,changed_at)
-      VALUES('cases',NEW.case_ref,'UPDATE',json_object('case_ref',OLD.case_ref,'title',OLD.title,'category',OLD.category,'status',OLD.status,'officer_id',OLD.officer_id,'opened_on',OLD.opened_on,'location',OLD.location,'resolution',OLD.resolution),json_object('case_ref',NEW.case_ref,'title',NEW.title,'category',NEW.category,'status',NEW.status,'officer_id',NEW.officer_id,'opened_on',NEW.opened_on,'location',NEW.location,'resolution',NEW.resolution),casework_app_user(),{stamp});
+    CREATE TRIGGER IF NOT EXISTS cases_require_fields_update BEFORE UPDATE OF title,category,opened_on,location ON cases WHEN length(trim(NEW.title))=0 OR length(trim(NEW.category))=0 OR NEW.opened_on IS NULL OR length(trim(NEW.location))=0 BEGIN
+      SELECT RAISE(ABORT,'CASEWORK_REQUIRED_CASE_FIELDS: Use case ID format CASE-YYYY-NNN and provide title, category, date opened, and location.');
     END;
-    CREATE TRIGGER IF NOT EXISTS cases_audit_delete AFTER DELETE ON cases BEGIN
-      INSERT INTO audit_log(table_name,record_key,action,old_values,new_values,changed_by,changed_at)
-      VALUES('cases',OLD.case_ref,'DELETE',json_object('case_ref',OLD.case_ref,'title',OLD.title,'category',OLD.category,'status',OLD.status,'officer_id',OLD.officer_id,'opened_on',OLD.opened_on,'location',OLD.location,'resolution',OLD.resolution),NULL,casework_app_user(),{stamp});
+    CREATE TRIGGER IF NOT EXISTS cases_history_insert AFTER INSERT ON cases BEGIN
+      INSERT INTO case_status_history(case_reference,event_type,old_values,new_values,changed_by,changed_at)
+      VALUES(NEW.case_ref,'CASE_CREATED',NULL,json_object('case_ref',NEW.case_ref,'title',NEW.title,'category',NEW.category,'status',NEW.status,'officer_id',NEW.officer_id,'opened_on',NEW.opened_on,'location',NEW.location,'resolution',NEW.resolution),casework_app_user(),{stamp});
     END;
-    CREATE TRIGGER IF NOT EXISTS cases_status_history_update AFTER UPDATE ON cases WHEN OLD.status IS NOT NEW.status BEGIN
-      INSERT INTO case_status_history(case_reference,old_status,new_status,changed_by,changed_at)
-      VALUES(NEW.case_ref,OLD.status,NEW.status,casework_app_user(),{stamp});
+    CREATE TRIGGER IF NOT EXISTS cases_history_update AFTER UPDATE ON cases
+    WHEN OLD.case_ref IS NOT NEW.case_ref OR OLD.title IS NOT NEW.title OR OLD.category IS NOT NEW.category OR OLD.status IS NOT NEW.status OR OLD.officer_id IS NOT NEW.officer_id OR OLD.opened_on IS NOT NEW.opened_on OR OLD.location IS NOT NEW.location OR OLD.resolution IS NOT NEW.resolution BEGIN
+      INSERT INTO case_status_history(case_reference,event_type,old_status,new_status,old_values,new_values,changed_by,changed_at)
+      VALUES(NEW.case_ref,CASE WHEN OLD.status IS NOT NEW.status THEN 'STATUS_CHANGED' ELSE 'CASE_UPDATED' END,CASE WHEN OLD.status IS NOT NEW.status THEN OLD.status ELSE NULL END,CASE WHEN OLD.status IS NOT NEW.status THEN NEW.status ELSE NULL END,json_object('case_ref',OLD.case_ref,'title',OLD.title,'category',OLD.category,'status',OLD.status,'officer_id',OLD.officer_id,'opened_on',OLD.opened_on,'location',OLD.location,'resolution',OLD.resolution),json_object('case_ref',NEW.case_ref,'title',NEW.title,'category',NEW.category,'status',NEW.status,'officer_id',NEW.officer_id,'opened_on',NEW.opened_on,'location',NEW.location,'resolution',NEW.resolution),casework_app_user(),{stamp});
+    END;
+    CREATE TRIGGER IF NOT EXISTS cases_history_delete AFTER DELETE ON cases BEGIN
+      INSERT INTO case_status_history(case_reference,event_type,old_values,changed_by,changed_at)
+      VALUES(OLD.case_ref,'CASE_DELETED',json_object('case_ref',OLD.case_ref,'title',OLD.title,'category',OLD.category,'status',OLD.status,'officer_id',OLD.officer_id,'opened_on',OLD.opened_on,'location',OLD.location,'resolution',OLD.resolution),casework_app_user(),{stamp});
     END;
     CREATE TRIGGER IF NOT EXISTS cases_block_closed_delete BEFORE DELETE ON cases WHEN OLD.status='Closed' BEGIN
       SELECT RAISE(ABORT,'CASEWORK_CLOSED_CASE_DELETE: Closed cases cannot be deleted.');
@@ -208,12 +304,11 @@ def install_sqlite_audit_triggers(cur):
     END;
     ''')
 
-def install_mysql_audit_triggers(cur):
+def install_mysql_case_history_triggers(cur):
     triggers={
-      'cases_audit_insert':"""CREATE TRIGGER cases_audit_insert AFTER INSERT ON cases FOR EACH ROW INSERT INTO audit_log(table_name,record_key,action,old_values,new_values,changed_by,changed_at) VALUES('cases',NEW.case_ref,'INSERT',NULL,JSON_OBJECT('case_ref',NEW.case_ref,'title',NEW.title,'category',NEW.category,'status',NEW.status,'officer_id',NEW.officer_id,'opened_on',NEW.opened_on,'location',NEW.location,'resolution',NEW.resolution),@app_user,DATE_FORMAT(UTC_TIMESTAMP(6),'%Y-%m-%dT%H:%i:%s.%fZ'))""",
-      'cases_audit_update':"""CREATE TRIGGER cases_audit_update AFTER UPDATE ON cases FOR EACH ROW INSERT INTO audit_log(table_name,record_key,action,old_values,new_values,changed_by,changed_at) VALUES('cases',NEW.case_ref,'UPDATE',JSON_OBJECT('case_ref',OLD.case_ref,'title',OLD.title,'category',OLD.category,'status',OLD.status,'officer_id',OLD.officer_id,'opened_on',OLD.opened_on,'location',OLD.location,'resolution',OLD.resolution),JSON_OBJECT('case_ref',NEW.case_ref,'title',NEW.title,'category',NEW.category,'status',NEW.status,'officer_id',NEW.officer_id,'opened_on',NEW.opened_on,'location',NEW.location,'resolution',NEW.resolution),@app_user,DATE_FORMAT(UTC_TIMESTAMP(6),'%Y-%m-%dT%H:%i:%s.%fZ'))""",
-      'cases_audit_delete':"""CREATE TRIGGER cases_audit_delete AFTER DELETE ON cases FOR EACH ROW INSERT INTO audit_log(table_name,record_key,action,old_values,new_values,changed_by,changed_at) VALUES('cases',OLD.case_ref,'DELETE',JSON_OBJECT('case_ref',OLD.case_ref,'title',OLD.title,'category',OLD.category,'status',OLD.status,'officer_id',OLD.officer_id,'opened_on',OLD.opened_on,'location',OLD.location,'resolution',OLD.resolution),NULL,@app_user,DATE_FORMAT(UTC_TIMESTAMP(6),'%Y-%m-%dT%H:%i:%s.%fZ'))""",
-      'cases_status_history_update':"""CREATE TRIGGER cases_status_history_update AFTER UPDATE ON cases FOR EACH ROW BEGIN IF NOT (OLD.status <=> NEW.status) THEN INSERT INTO case_status_history(case_reference,old_status,new_status,changed_by,changed_at) VALUES(NEW.case_ref,OLD.status,NEW.status,@app_user,DATE_FORMAT(UTC_TIMESTAMP(6),'%Y-%m-%dT%H:%i:%s.%fZ')); END IF; END""",
+      'cases_history_insert':"""CREATE TRIGGER cases_history_insert AFTER INSERT ON cases FOR EACH ROW INSERT INTO case_status_history(case_reference,event_type,new_values,changed_by,changed_at) VALUES(NEW.case_ref,'CASE_CREATED',JSON_OBJECT('case_ref',NEW.case_ref,'title',NEW.title,'category',NEW.category,'status',NEW.status,'officer_id',NEW.officer_id,'opened_on',NEW.opened_on,'location',NEW.location,'resolution',NEW.resolution),@app_user,DATE_FORMAT(UTC_TIMESTAMP(6),'%Y-%m-%dT%H:%i:%s.%fZ'))""",
+      'cases_history_update':"""CREATE TRIGGER cases_history_update AFTER UPDATE ON cases FOR EACH ROW BEGIN IF NOT (OLD.case_ref <=> NEW.case_ref) OR NOT (OLD.title <=> NEW.title) OR NOT (OLD.category <=> NEW.category) OR NOT (OLD.status <=> NEW.status) OR NOT (OLD.officer_id <=> NEW.officer_id) OR NOT (OLD.opened_on <=> NEW.opened_on) OR NOT (OLD.location <=> NEW.location) OR NOT (OLD.resolution <=> NEW.resolution) THEN INSERT INTO case_status_history(case_reference,event_type,old_status,new_status,old_values,new_values,changed_by,changed_at) VALUES(NEW.case_ref,IF(NOT (OLD.status <=> NEW.status),'STATUS_CHANGED','CASE_UPDATED'),IF(NOT (OLD.status <=> NEW.status),OLD.status,NULL),IF(NOT (OLD.status <=> NEW.status),NEW.status,NULL),JSON_OBJECT('case_ref',OLD.case_ref,'title',OLD.title,'category',OLD.category,'status',OLD.status,'officer_id',OLD.officer_id,'opened_on',OLD.opened_on,'location',OLD.location,'resolution',OLD.resolution),JSON_OBJECT('case_ref',NEW.case_ref,'title',NEW.title,'category',NEW.category,'status',NEW.status,'officer_id',NEW.officer_id,'opened_on',NEW.opened_on,'location',NEW.location,'resolution',NEW.resolution),@app_user,DATE_FORMAT(UTC_TIMESTAMP(6),'%Y-%m-%dT%H:%i:%s.%fZ')); END IF; END""",
+      'cases_history_delete':"""CREATE TRIGGER cases_history_delete AFTER DELETE ON cases FOR EACH ROW INSERT INTO case_status_history(case_reference,event_type,old_values,changed_by,changed_at) VALUES(OLD.case_ref,'CASE_DELETED',JSON_OBJECT('case_ref',OLD.case_ref,'title',OLD.title,'category',OLD.category,'status',OLD.status,'officer_id',OLD.officer_id,'opened_on',OLD.opened_on,'location',OLD.location,'resolution',OLD.resolution),@app_user,DATE_FORMAT(UTC_TIMESTAMP(6),'%Y-%m-%dT%H:%i:%s.%fZ'))""",
       'cases_block_closed_delete':"""CREATE TRIGGER cases_block_closed_delete BEFORE DELETE ON cases FOR EACH ROW BEGIN IF OLD.status='Closed' THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='CASEWORK_CLOSED_CASE_DELETE: Closed cases cannot be deleted.'; END IF; END""",
       'cases_reject_reopen':"""CREATE TRIGGER cases_reject_reopen BEFORE UPDATE ON cases FOR EACH ROW BEGIN IF OLD.status='Closed' AND NEW.status<>'Closed' THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='CASEWORK_INVALID_STATUS_TRANSITION: A closed case cannot be reopened or moved to another status.'; END IF; END""",
       'custody_log_no_update':"""CREATE TRIGGER custody_log_no_update BEFORE UPDATE ON custody_log FOR EACH ROW BEGIN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='CASEWORK_CUSTODY_APPEND_ONLY: Custody history cannot be updated.'; END""",
@@ -221,7 +316,7 @@ def install_mysql_audit_triggers(cur):
     }
     for name,statement in triggers.items():
         cur.execute(sql('SELECT ACTION_STATEMENT FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() AND TRIGGER_NAME=?'),(name,));existing=one_dict(cur)
-        if existing and name.startswith('cases_audit_') and 'resolution' not in existing['ACTION_STATEMENT'].lower():
+        if existing and name.startswith('cases_history_') and name!='cases_history_insert' and 'old_values' not in existing['ACTION_STATEMENT'].lower():
             cur.execute(f'DROP TRIGGER {name}');existing=None
         if not existing:cur.execute(statement)
 
@@ -420,9 +515,13 @@ class API(BaseHTTPRequestHandler):
         auth=authorize(user)
         if auth:return self.session_required_response() if getattr(self,'_session_expired',False) else (auth[0],auth[1],{})
         if path=='/api/auth/change-password':return self.change_password(m,b,user)
+        if path=='/api/officer-requests':return self.officer_requests(m,b,user)
+        if path.startswith('/api/officer-requests/'):return self.review_officer_request(m,path.rsplit('/',1)[-1],b,user)
         if path=='/api/users' or path.startswith('/api/users/'):
             if user['role']!='Management Head':return 403,{'error':'Management Head access is required to manage user accounts.'},{ }
             if path=='/api/users':return self.user_collection(m,b,user)
+            if path.endswith('/reset-password'):
+                return self.reset_user_password(m,path.split('/')[-2],b,user)
             return self.user_detail(m,path.rsplit('/',1)[-1],b,user)
         if path=='/api/dashboard' and m=='GET':
             c=connect()
@@ -430,7 +529,7 @@ class API(BaseHTTPRequestHandler):
                 cur=c.cursor();today=date.today()
                 scope='';params=()
                 cur.execute(sql("SELECT COUNT(*) total,SUM(CASE WHEN status='Active' THEN 1 ELSE 0 END) active,SUM(CASE WHEN status='Under review' THEN 1 ELSE 0 END) review,SUM(CASE WHEN status='Closed' THEN 1 ELSE 0 END) closed FROM cases"+scope),params);counts=one_dict(cur) or {}
-                cur.execute(sql('SELECT case_ref id,title,category,status,officer_name officer,opened_on date,location FROM case_view'+scope+' ORDER BY created_at DESC LIMIT 5'),params);recent=cursor_dicts(cur)
+                cur.execute(sql('SELECT case_ref id,title,category,status,officer_name officer,opened_on date,location,resolution,(SELECT COUNT(*) FROM evidence e WHERE e.case_reference=case_view.case_ref) evidence_count,(SELECT COUNT(*) FROM hearings h WHERE h.case_reference=case_view.case_ref) hearing_count FROM case_view'+scope+' ORDER BY id DESC LIMIT 10'),params);recent=cursor_dicts(cur)
                 hearing_scope=' AND c.officer_id=?' if scope else '';hearing_params=(today.isoformat(),(today+timedelta(days=14)).isoformat())+params
                 cur.execute(sql("SELECT h.id,h.case_reference,c.title case_title,h.court,h.hearing_date,h.status FROM hearings h JOIN cases c ON c.case_ref=h.case_reference WHERE h.hearing_date>=? AND h.hearing_date<=? AND h.status IN ('Scheduled','Adjourned')"+hearing_scope+" ORDER BY h.hearing_date,h.id LIMIT 100"),hearing_params);upcoming=cursor_dicts(cur)
                 return 200,{'counts':{k:int(counts.get(k) or 0) for k in ('total','active','review','closed')},'recent':[json_safe(x) for x in recent],'upcoming_hearings':[json_safe(x) for x in upcoming]},{}
@@ -463,6 +562,9 @@ class API(BaseHTTPRequestHandler):
         if path=='/api/officers' and m=='GET':
             return self.list_officers(q)
         if path=='/api/officers' and m=='POST':return self.create_officer(b,user)
+        if path=='/api/teams' and m=='GET':return self.list_teams()
+        if path=='/api/teams' and m=='POST':return self.create_team(b,user)
+        if path.startswith('/api/teams/'):return self.team_detail(m,path.rsplit('/',1)[-1],b,user)
         if path.startswith('/api/officers/') and path.endswith('/transfer-cases'):
             return self.transfer_cases_endpoint(m,unquote(path[len('/api/officers/'): -len('/transfer-cases')].rstrip('/')),b,user)
         if path.startswith('/api/officers/'):return self.officer_detail(m,path.rsplit('/',1)[-1],b,user)
@@ -557,6 +659,22 @@ class API(BaseHTTPRequestHandler):
             activity(c,'updated','user',next_username,'Updated user account details or access',user['username']);c.commit();existing['username']=next_username;existing['name']=next_name;existing['role']=next_role;existing['active']=next_active;return 200,{'item':existing},{ }
         except Exception:c.rollback();raise
         finally:c.close()
+    def reset_user_password(self,m,ident,b,user):
+        if m!='POST':return 405,{'error':'Method not allowed.'},{}
+        try:uid=int(ident)
+        except ValueError:return 404,{'error':'User account was not found.'},{}
+        password=str(b.get('password') or '').strip();generate_only=bool(b.get('generate_only'))
+        if not password and not generate_only:raise ValueError('Choose a password or generate a temporary one first.')
+        if password and len(password)<12:raise ValueError('Password must be at least 12 characters long.')
+        c=connect()
+        try:
+            cur=c.cursor();cur.execute(sql('SELECT username FROM users WHERE id=?'),(uid,));account=one_dict(cur)
+            if not account:return 404,{'error':'User account was not found.'},{}
+            if generate_only:return 200,{'username':account['username'],'generated':True,'temporary_password':secrets.token_urlsafe(15),'set':False},{}
+            cur.execute(sql('UPDATE users SET password_hash=? WHERE id=?'),(hash_password(password),uid));cur.execute(sql('DELETE FROM sessions WHERE user_id=?'),(uid,));activity(c,'reset_password','user',account['username'],'Administrator reset account password',user['username']);c.commit();result={'username':account['username'],'generated':False,'set':True}
+            return 200,result,{}
+        except Exception:c.rollback();raise
+        finally:c.close()
     def list_cases(self,q,user):
         c=connect()
         try:
@@ -564,16 +682,17 @@ class API(BaseHTTPRequestHandler):
             if search:terms.append('(case_ref LIKE ? OR title LIKE ? OR category LIKE ? OR location LIKE ? OR officer_name LIKE ?)');vals.extend([f'%{search}%']*5)
             if status:terms.append('status=?');vals.append(status)
             if category:terms.append('category=?');vals.append(category)
-            where=(' WHERE '+' AND '.join(terms)) if terms else '';cur=c.cursor();cur.execute('SELECT COUNT(*) n FROM case_view'+where,vals);total=one_dict(cur)['n'];limit=min(max(int((q.get('limit') or ['100'])[0]),1),250);offset=max(int((q.get('offset') or ['0'])[0]),0);cur.execute('SELECT case_ref id,id db_id,title,category,status,officer_id,officer_name officer,opened_on date,location,resolution,created_at,updated_at FROM case_view'+where+' ORDER BY created_at DESC LIMIT ? OFFSET ?',vals+[limit,offset]);return 200,{'items':[json_safe(x) for x in cursor_dicts(cur)],'total':total},{}
+            where=(' WHERE '+' AND '.join(terms)) if terms else '';cur=c.cursor();cur.execute('SELECT COUNT(*) n FROM case_view'+where,vals);total=one_dict(cur)['n'];limit=min(max(int((q.get('limit') or ['100'])[0]),1),250);offset=max(int((q.get('offset') or ['0'])[0]),0);cur.execute('SELECT case_ref id,id db_id,title,category,status,officer_id,officer_name officer,opened_on date,location,resolution,(SELECT COUNT(*) FROM evidence e WHERE e.case_reference=case_view.case_ref) evidence_count,(SELECT COUNT(*) FROM hearings h WHERE h.case_reference=case_view.case_ref) hearing_count,created_at,updated_at FROM case_view'+where+' ORDER BY id DESC LIMIT ? OFFSET ?',vals+[limit,offset]);items=[json_safe(x) for x in cursor_dicts(cur)]
+            for item in items:
+                assignments=self.get_case(c,item['id']);item['assigned_members']=assignments.get('assigned_members',[]);item['assigned_teams']=assignments.get('assigned_teams',[]);item['officer_names']=', '.join(x['name'] for x in item['assigned_members']) or item.get('officer') or ''
+            return 200,{'items':items,'total':total},{}
         finally:c.close()
     def create_case(self,b,user):
         denied=authorize(user,True)
         if denied:return denied[0],denied[1],{}
-        d={k:clean_text(b,k,label,maxlen) for k,label,maxlen in [('id','Case reference',80),('title','Case title',240),('category','Category',100),('status','Status',40)]};d['location']=clean_text(b,'location','Location',240,False);off=clean_text(b,'officer','Assigned officer',160,False);opened=clean_text(b,'date','Date opened',10,False)
+        d={k:clean_text(b,k,label,maxlen) for k,label,maxlen in [('title','Case title',240),('category','Category',100),('status','Status',40)]};d['location']=clean_text(b,'location','Location',240);off=clean_text(b,'officer','Assigned officer',160,False);opened=clean_text(b,'date','Date opened',10)
         if d['status'] not in CASE_STATUS:raise ValueError('Unsupported case status.')
-        if opened:
-            try:date.fromisoformat(opened)
-            except ValueError:raise ValueError('Date opened must use YYYY-MM-DD format.')
+        opened=validate_date(opened,'Date opened').isoformat()
         c=connect()
         try:
             set_db_actor(c,user);cur=c.cursor();oid=None
@@ -581,7 +700,10 @@ class API(BaseHTTPRequestHandler):
                 cur.execute(sql('SELECT id FROM officers WHERE name=? OR badge=?'),(off,off));row=one_dict(cur)
                 if not row:return 400,{'error':'Assigned officer was not found. Choose a team member from the directory.'},{}
                 oid=row['id']
-            now=utcnow();cur.execute(sql('INSERT INTO cases(case_ref,title,category,status,officer_id,opened_on,location,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)'),(d['id'],d['title'],d['category'],d['status'],oid,opened or None,d['location'],now,now));ref=d['id'];activity(c,'created','case',ref,f'Case record registered: {d["title"]}',user['username']);c.commit();return 201,{'item':self.get_case(c,ref)},{}
+            cur.execute(sql('SELECT COALESCE(MAX(CAST(SUBSTR(case_ref,11) AS INTEGER)),0) AS last_number FROM cases WHERE case_ref LIKE ?'),(f'CASE-{date.today().year}-%',));ref=f'CASE-{date.today().year}-{int(one_dict(cur)["last_number"])+1:03d}'
+            now=utcnow();cur.execute(sql('INSERT INTO cases(case_ref,title,category,status,officer_id,opened_on,location,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)'),(ref,d['title'],d['category'],d['status'],oid,opened,d['location'],now,now));case_id=cur.lastrowid
+            if oid:cur.execute(sql('INSERT INTO case_members(case_id,officer_id,assigned_at) VALUES(?,?,?)'),(case_id,oid,now))
+            activity(c,'created','case',ref,f'Case record registered: {d["title"]}',user['username']);c.commit();return 201,{'item':self.get_case(c,ref)},{}
         except Exception:
             c.rollback();raise
         finally:c.close()
@@ -591,13 +713,31 @@ class API(BaseHTTPRequestHandler):
         if denied:return denied[0],denied[1],{}
         c=connect()
         try:
-            if b.get('officer_id'):
-                cur=c.cursor();cur.execute(sql('SELECT id,name,badge FROM officers WHERE id=?'),(int(b['officer_id']),));officer=one_dict(cur)
-                if not officer:return 404,{'error':'Team member was not found.'},{}
-                set_db_actor(c,user);cur.execute(sql('UPDATE cases SET officer_id=?,updated_at=? WHERE case_ref=?'),(officer['id'],utcnow(),ref))
-                if not cur.rowcount:return 404,{'error':'Case record was not found.'},{}
-                activity(c,'assigned','case',ref,f"Case assigned to {officer['name']}",user['username']);c.commit()
-                return 200,{'assigned_officer':officer['name'],'case_reference':ref},{ }
+            cur=c.cursor();cur.execute(sql('SELECT id FROM cases WHERE case_ref=?'),(ref,));case=one_dict(cur)
+            if not case:return 404,{'error':'Case record was not found.'},{}
+            member_ids=b.get('officer_ids',[]);team_ids=b.get('team_ids',[])
+            if 'officer_ids' not in b and 'team_ids' not in b and 'officer_id' not in b:
+                cur.execute(sql("SELECT o.id FROM officers o LEFT JOIN case_members cm ON cm.officer_id=o.id LEFT JOIN cases assigned ON assigned.id=cm.case_id AND assigned.status='Active' GROUP BY o.id ORDER BY COUNT(assigned.id),o.id LIMIT 1"));least_loaded=one_dict(cur)
+                if least_loaded:member_ids=[least_loaded['id']]
+            if isinstance(member_ids,str):member_ids=[x for x in member_ids.split(',') if x]
+            if isinstance(team_ids,str):team_ids=[x for x in team_ids.split(',') if x]
+            if 'officer_id' in b and b.get('officer_id'):member_ids=[b['officer_id']]
+            member_ids=list(dict.fromkeys(int(x) for x in member_ids));team_ids=list(dict.fromkeys(int(x) for x in team_ids))
+            for oid in member_ids:
+                cur.execute(sql('SELECT id FROM officers WHERE id=?'),(oid,))
+                if not one_dict(cur):return 400,{'error':f'Team member {oid} was not found.'},{}
+            for tid in team_ids:
+                cur.execute(sql('SELECT id FROM teams WHERE id=?'),(tid,))
+                if not one_dict(cur):return 400,{'error':f'Team {tid} was not found.'},{}
+            now=utcnow();cur.execute(sql('DELETE FROM case_members WHERE case_id=?'),(case['id'],));cur.execute(sql('DELETE FROM case_teams WHERE case_id=?'),(case['id'],))
+            for oid in member_ids:cur.execute(sql('INSERT INTO case_members(case_id,officer_id,assigned_at) VALUES(?,?,?)'),(case['id'],oid,now))
+            for tid in team_ids:cur.execute(sql('INSERT INTO case_teams(case_id,team_id,assigned_at) VALUES(?,?,?)'),(case['id'],tid,now))
+            primary=member_ids[0] if member_ids else None
+            if not primary and team_ids:
+                cur.execute(sql('SELECT id FROM officers WHERE team_id=? ORDER BY id LIMIT 1'),(team_ids[0],));first=one_dict(cur);primary=first['id'] if first else None
+            set_db_actor(c,user);cur.execute(sql('UPDATE cases SET officer_id=?,updated_at=? WHERE id=?'),(primary,now,case['id']))
+            activity(c,'assigned','case',ref,f'Case assigned to {len(member_ids)} members and {len(team_ids)} teams',user['username']);c.commit()
+            return 200,{'case_reference':ref,'assigned_officers':member_ids,'assigned_teams':team_ids},{}
             if os.environ.get('CASEWORK_DB','sqlite').lower()=='mysql':
                 set_db_actor(c,user);cur=c.cursor();cur.execute(sql('CALL assign_officer(?)'),(ref,))
                 while cur.nextset():pass
@@ -651,16 +791,20 @@ class API(BaseHTTPRequestHandler):
             raise
         finally:c.close()
     def get_case(self,c,ref):
-        cur=c.cursor();cur.execute(sql('SELECT case_ref id,id db_id,title,category,status,officer_id,officer_name officer,opened_on date,location,resolution,created_at,updated_at FROM case_view WHERE case_ref=?'),(ref,));return json_safe(one_dict(cur))
+        cur=c.cursor();cur.execute(sql('SELECT case_ref id,id db_id,title,category,status,officer_id,officer_name officer,opened_on date,location,resolution,created_at,updated_at FROM case_view WHERE case_ref=?'),(ref,));item=json_safe(one_dict(cur))
+        if not item:return item
+        cur.execute(sql('SELECT o.id,o.name,o.role,o.badge,t.id team_id,t.name team_name FROM case_members cm JOIN officers o ON o.id=cm.officer_id LEFT JOIN teams t ON t.id=o.team_id WHERE cm.case_id=? ORDER BY o.name'),(item['db_id'],));item['assigned_members']=cursor_dicts(cur)
+        cur.execute(sql('SELECT t.id,t.name FROM case_teams ct JOIN teams t ON t.id=ct.team_id WHERE ct.case_id=? ORDER BY t.name'),(item['db_id'],));item['assigned_teams']=cursor_dicts(cur)
+        item['officer_names']=', '.join(x['name'] for x in item['assigned_members']) or item.get('officer') or ''
+        return item
     def case_history(self,m,ref,user):
         if m!='GET':return 405,{'error':'Method not allowed.'},{}
         c=connect()
         try:
             cur=c.cursor();cur.execute(sql('SELECT case_ref,officer_id FROM cases WHERE case_ref=?'),(ref,));case=one_dict(cur)
-            cur.execute(sql('SELECT action,old_values,new_values,changed_by,changed_at FROM audit_log WHERE table_name=? AND record_key=? ORDER BY id'),('cases',ref));audit=cursor_dicts(cur)
-            cur.execute(sql('SELECT old_status,new_status,changed_by,changed_at FROM case_status_history WHERE case_reference=? ORDER BY id'),(ref,));statuses=cursor_dicts(cur)
-            items=[{'type':'record','action':row['action'],'old_values':row['old_values'],'new_values':row['new_values'],'changed_by':row['changed_by'],'changed_at':row['changed_at']} for row in audit]
-            items.extend({'type':'status','action':'STATUS','old_status':row['old_status'],'new_status':row['new_status'],'changed_by':row['changed_by'],'changed_at':row['changed_at']} for row in statuses)
+            cur.execute(sql('SELECT event_type,old_status,new_status,old_values,new_values,changed_by,changed_at FROM case_status_history WHERE case_reference=? ORDER BY id'),(ref,));history=cursor_dicts(cur)
+            items=[{'type':'status' if row['event_type']=='STATUS_CHANGED' else 'record','action':{'STATUS_CHANGED':'STATUS','CASE_CREATED':'created','CASE_UPDATED':'update','CASE_DELETED':'delete'}.get(row['event_type'],'update'),'old_status':row['old_status'],'new_status':row['new_status'],'old_values':row['old_values'],'new_values':row['new_values'],'changed_by':row['changed_by'],'changed_at':row['changed_at']} for row in history]
+            items.sort(key=lambda row:row['changed_at'] or '',reverse=True)
             items.sort(key=lambda row:row['changed_at'] or '',reverse=True)
             return 200,{'case_reference':ref,'items':items},{}
         finally:c.close()
@@ -677,17 +821,17 @@ class API(BaseHTTPRequestHandler):
                 set_db_actor(c,user)
                 cur.execute(sql('DELETE FROM cases WHERE case_ref=?'),(ref,));activity(c,'deleted','case',ref,'Case record deleted',user['username']);c.commit();return 200,{'ok':True},{}
             if m=='PUT':
-                old=self.get_case(c,ref);d={k:clean_text(b,k,label,maxlen) for k,label,maxlen in [('title','Case title',240),('category','Category',100),('status','Status',40)]};d['location']=clean_text(b,'location','Location',240,False);off=clean_text(b,'officer','Assigned officer',160,False);opened=clean_text(b,'date','Date opened',10,False)
+                old=self.get_case(c,ref);d={k:clean_text(b,k,label,maxlen) for k,label,maxlen in [('title','Case title',240),('category','Category',100),('status','Status',40)]};d['location']=clean_text(b,'location','Location',240);off=clean_text(b,'officer','Assigned officer',160,False);opened=clean_text(b,'date','Date opened',10)
                 if d['status'] not in CASE_STATUS:raise ValueError('Unsupported case status.')
-                if opened:
-                    try:date.fromisoformat(opened)
-                    except ValueError:raise ValueError('Date opened must use YYYY-MM-DD format.')
+                opened=validate_date(opened,'Date opened').isoformat()
                 oid=None
                 if off:
                     cur.execute(sql('SELECT id FROM officers WHERE name=? OR badge=?'),(off,off));o=one_dict(cur)
                     if not o:return 400,{'error':'Assigned officer was not found.'},{}
                     oid=o['id']
-                set_db_actor(c,user);cur.execute(sql('UPDATE cases SET title=?,category=?,status=?,officer_id=?,opened_on=?,location=?,updated_at=? WHERE case_ref=?'),(d['title'],d['category'],d['status'],oid,opened or None,d['location'],utcnow(),ref));activity(c,'updated','case',ref,f'Case record updated: {old["status"]} to {d["status"]}',user['username']);c.commit();return 200,{'item':self.get_case(c,ref)},{}
+                set_db_actor(c,user);cur.execute(sql('UPDATE cases SET title=?,category=?,status=?,officer_id=?,opened_on=?,location=?,updated_at=? WHERE case_ref=?'),(d['title'],d['category'],d['status'],oid,opened,d['location'],utcnow(),ref));cur.execute(sql('SELECT id FROM cases WHERE case_ref=?'),(ref,));case_id=one_dict(cur)['id'];cur.execute(sql('DELETE FROM case_members WHERE case_id=?'),(case_id,));cur.execute(sql('DELETE FROM case_teams WHERE case_id=?'),(case_id,))
+                if oid:cur.execute(sql('INSERT INTO case_members(case_id,officer_id,assigned_at) VALUES(?,?,?)'),(case_id,oid,utcnow()))
+                activity(c,'updated','case',ref,f'Case record updated: {old["status"]} to {d["status"]}',user['username']);c.commit();return 200,{'item':self.get_case(c,ref)},{}
             return 405,{'error':'Method not allowed.'},{}
         except Exception as error:
             c.rollback();message=case_trigger_message(error)
@@ -739,7 +883,7 @@ class API(BaseHTTPRequestHandler):
         if denied:return denied[0],denied[1],{}
         d={k:clean_text(b,k,label,maxlen) for k,label,maxlen in [('name','Name',160),('status','Status',60),('charge','Primary charge',240)]};links,_=self.normalize_person_links(b);age=b.get('age')
         if d['status'] not in PERSON_STATUS:raise ValueError('Unsupported person status.')
-        age=int(age) if age not in (None,'',chr(8212)) else None
+        age=parse_age(age)
         if age is not None and not 0<=age<=120:raise ValueError('Age must be between 0 and 120.')
         c=connect()
         try:
@@ -774,7 +918,7 @@ class API(BaseHTTPRequestHandler):
             if denied:return denied[0],denied[1],{}
             if m=='DELETE':cur.execute(sql('DELETE FROM persons WHERE id=?'),(r['id'],));activity(c,'deleted','person',ident,'Person of interest deleted',user['username']);c.commit();return 200,{'ok':True},{}
             if m=='PUT':
-                d={k:clean_text(b,k,label,maxlen) for k,label,maxlen in [('name','Name',160),('status','Status',60),('charge','Primary charge',240)]};links,_=self.normalize_person_links(b);age=b.get('age');age=int(age) if age not in (None,'',chr(8212)) else None
+                d={k:clean_text(b,k,label,maxlen) for k,label,maxlen in [('name','Name',160),('status','Status',60),('charge','Primary charge',240)]};links,_=self.normalize_person_links(b);age=parse_age(b.get('age'))
                 if d['status'] not in PERSON_STATUS:raise ValueError('Unsupported person status.')
                 if age is not None and not 0<=age<=120:raise ValueError('Age must be between 0 and 120.')
                 if self.replace_person_links(c,r['id'],links) is None:return 400,{'error':'A linked case was not found.'},{}
@@ -794,7 +938,8 @@ class API(BaseHTTPRequestHandler):
     def case_evidence(self,m,ref,b,user):
         c=connect()
         try:
-            cur=c.cursor();cur.execute(sql('SELECT case_ref,officer_id FROM cases WHERE case_ref=?'),(ref,));case=one_dict(cur)
+            cur=c.cursor();cur.execute(sql('SELECT case_ref,officer_id FROM cases WHERE case_ref=? OR CAST(id AS CHAR)=?'),(ref,ref));case=one_dict(cur)
+            if case:ref=case['case_ref']
             if not case:return 404,{'error':'Case record was not found.'},{}
             if m=='GET':
                 cur.execute(sql('SELECT id FROM evidence WHERE case_reference=? ORDER BY collected_at DESC,id DESC'),(ref,));return 200,{'case_reference':ref,'items':[self.evidence_item(c,row['id']) for row in cursor_dicts(cur)]},{}
@@ -855,18 +1000,20 @@ class API(BaseHTTPRequestHandler):
     def hearing_values(self,b):
         court=clean_text(b,'court','Court',240);hearing_date=clean_text(b,'hearing_date','Hearing date',10);status=clean_text(b,'status','Hearing status',24)
         try:
-            parsed=date.fromisoformat(hearing_date)
-            if parsed.isoformat()!=hearing_date:raise ValueError()
-        except ValueError:raise ValueError('Hearing date must use YYYY-MM-DD format.')
+            parsed=validate_date(hearing_date,'Hearing date')
+        except ValueError:raise
         if status not in HEARING_STATUS:raise ValueError('Unsupported hearing status.')
+        if status=='Scheduled' and parsed<date.today():raise ValueError('A scheduled hearing cannot be in the past.')
         outcome=clean_text(b,'outcome','Outcome',4000,False);notes=clean_text(b,'notes','Notes',8000,False)
-        return court,hearing_date,status,outcome or None,notes or None
+        return court,parsed.isoformat(),status,outcome or None,notes or None
     def hearing_item(self,c,hearing_id):
         cur=c.cursor();cur.execute(sql('SELECT h.id,h.case_reference,c.title case_title,h.court,h.hearing_date,h.status,h.outcome,h.notes FROM hearings h JOIN cases c ON c.case_ref=h.case_reference WHERE h.id=?'),(hearing_id,));return json_safe(one_dict(cur))
     def case_hearings(self,m,ref,b,user):
         c=connect()
         try:
-            cur=c.cursor();cur.execute(sql('SELECT case_ref,officer_id FROM cases WHERE case_ref=?'),(ref,));case=one_dict(cur)
+            cur=c.cursor();cur.execute(sql('SELECT case_ref,officer_id FROM cases WHERE case_ref=? OR CAST(id AS CHAR)=?'),(ref,ref));case=one_dict(cur)
+            if case:ref=case['case_ref']
+            if case:ref=case['case_ref']
             if not case:return 404,{'error':'Case record was not found.'},{}
             if m=='GET':
                 cur.execute(sql('SELECT id FROM hearings WHERE case_reference=? ORDER BY hearing_date,id'),(ref,));return 200,{'case_reference':ref,'items':[self.hearing_item(c,row['id']) for row in cursor_dicts(cur)]},{}
@@ -897,28 +1044,118 @@ class API(BaseHTTPRequestHandler):
             cur=c.cursor();s=(q.get('q') or [''])[0].strip();role=(q.get('role') or [''])[0];where=[];v=[]
             if s:where.append('(o.name LIKE ? OR o.badge LIKE ? OR o.role LIKE ?)');v.extend([f'%{s}%']*3)
             if role:where.append('o.role=?');v.append(role)
-            cur.execute(sql('SELECT o.id,o.name,o.role,o.badge,(SELECT COUNT(*) FROM cases c WHERE c.officer_id=o.id) cases FROM officers o'+((' WHERE '+' AND '.join(where)) if where else '')+' ORDER BY o.name'),v);return 200,{'items':cursor_dicts(cur)},{}
+            cur.execute(sql('SELECT o.id,o.name,o.role,o.badge,o.team_id,t.name team_name,u.id user_id,u.username,u.active account_active,(SELECT COUNT(*) FROM case_members cm WHERE cm.officer_id=o.id) cases FROM officers o LEFT JOIN teams t ON t.id=o.team_id LEFT JOIN users u ON u.id=o.user_id'+((' WHERE '+' AND '.join(where)) if where else '')+' ORDER BY o.name'),v);return 200,{'items':cursor_dicts(cur)},{}
         finally:c.close()
     def create_officer(self,b,user):
         denied=authorize(user,True)
         if denied:return denied[0],denied[1],{}
         d={k:clean_text(b,k,label,maxlen) for k,label,maxlen in [('name','Name',160),('role','Role',120),('badge','Badge ID',80)]};c=connect()
         try:
-            cur=c.cursor();now=utcnow();cur.execute(sql('INSERT INTO officers(name,role,badge,created_at,updated_at) VALUES(?,?,?,?,?)'),(d['name'],d['role'],d['badge'],now,now));oid=cur.lastrowid;activity(c,'created','officer',oid,'Team member added',user['username']);c.commit();cur.execute(sql('SELECT o.id,o.name,o.role,o.badge,(SELECT COUNT(*) FROM cases c WHERE c.officer_id=o.id) cases FROM officers o WHERE id=?'),(oid,));return 201,{'item':one_dict(cur)},{}
+            cur=c.cursor();now=utcnow();username=str(b.get('username') or re.sub(r'[^a-z0-9._-]+','.',d['name'].lower()).strip('.')).lower()
+            if not re.fullmatch(r'[a-z0-9._-]+',username):raise ValueError('Username may contain lowercase letters, numbers, periods, underscores, and hyphens.')
+            if user['role']=='Administrator':
+                team_id=int(b['team_id']) if b.get('team_id') else None
+                if team_id:
+                    cur.execute(sql('SELECT id FROM teams WHERE id=?'),(team_id,))
+                    if not one_dict(cur):raise ValueError('Choose an existing team.')
+                cur.execute(sql('SELECT id FROM users WHERE username=?'),(username,))
+                if one_dict(cur):username=f'{username}.{d["badge"].lower()}'
+                cur.execute(sql("SELECT id FROM officer_requests WHERE username=? AND status='Pending'"),(username,))
+                if one_dict(cur):return 409,{'error':'There is already a pending request with that username.'},{}
+                cur.execute(sql('SELECT id FROM officers WHERE badge=?'),(d['badge'],))
+                if one_dict(cur):return 409,{'error':'That badge ID is already in use.'},{}
+                cur.execute(sql("INSERT INTO officer_requests(name,role,badge,team_id,username,requested_by,status,created_at) VALUES(?,?,?,?,?,?,'Pending',?)"),(d['name'],d['role'],d['badge'],team_id,username,user['id'],now));request_id=cur.lastrowid
+                activity(c,'requested','officer',request_id,'Team member creation requested from a Management Head',user['username']);c.commit();return 202,{'request_id':request_id,'status':'Pending approval','message':'Approval requested. A Management Head must approve this team member before it is added.'},{}
+            cur.execute(sql('SELECT id FROM users WHERE username=?'),(username,))
+            if one_dict(cur):username=f'{username}.{d["badge"].lower()}'
+            password=secrets.token_urlsafe(15)
+            cur.execute(sql('INSERT INTO users(username,password_hash,name,role,active,created_at) VALUES(?,?,?,?,?,?)'),(username,hash_password(password),d['name'],'Operator',True,now));uid=cur.lastrowid
+            team_id=int(b['team_id']) if b.get('team_id') else None
+            if team_id:
+                cur.execute(sql('SELECT id FROM teams WHERE id=?'),(team_id,))
+                if not one_dict(cur):raise ValueError('Choose an existing team.')
+            cur.execute(sql('INSERT INTO officers(name,role,badge,team_id,user_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?)'),(d['name'],d['role'],d['badge'],team_id,uid,now,now));oid=cur.lastrowid
+            activity(c,'created','officer',oid,'Team member added with linked account',user['username']);c.commit();cur.execute(sql('SELECT o.id,o.name,o.role,o.badge,o.team_id,t.name team_name,u.id user_id,u.username,u.active account_active,(SELECT COUNT(*) FROM case_members cm WHERE cm.officer_id=o.id) cases FROM officers o LEFT JOIN teams t ON t.id=o.team_id JOIN users u ON u.id=o.user_id WHERE o.id=?'),(oid,));item=one_dict(cur);item['temporary_password']=password;return 201,{'item':item},{}
+        except Exception:c.rollback();raise
+        finally:c.close()
+    def officer_requests(self,m,b,user):
+        if user['role']=='Operator':return 403,{'error':'Management access is required.'},{}
+        if m!='GET':return 405,{'error':'Method not allowed.'},{}
+        c=connect()
+        try:
+            cur=c.cursor();cur.execute(sql("SELECT r.id,r.name,r.role,r.badge,r.team_id,r.username,r.status,r.created_at,u.name requested_by_name FROM officer_requests r JOIN users u ON u.id=r.requested_by ORDER BY CASE r.status WHEN 'Pending' THEN 0 ELSE 1 END,r.id DESC"))
+            return 200,{'items':cursor_dicts(cur)},{ }
+        finally:c.close()
+    def review_officer_request(self,m,ident,b,user):
+        if user['role']!='Management Head':return 403,{'error':'Only a Management Head can approve or reject a team member request.'},{ }
+        if m!='POST':return 405,{'error':'Method not allowed.'},{ }
+        decision=b.get('decision')
+        if decision not in ('approve','reject'):return 400,{'error':'Choose approve or reject.'},{ }
+        c=connect()
+        try:
+            cur=c.cursor();cur.execute(sql('SELECT * FROM officer_requests WHERE id=?'),(ident,));req=one_dict(cur)
+            if not req:return 404,{'error':'Approval request was not found.'},{ }
+            if req['status']!='Pending':return 409,{'error':'This request has already been reviewed.'},{ }
+            if decision=='reject':
+                cur.execute(sql("UPDATE officer_requests SET status='Rejected',reviewed_by=? WHERE id=?"),(user['id'],ident));activity(c,'rejected','officer_request',ident,'Team member request rejected',user['username']);c.commit();return 200,{'status':'Rejected'},{ }
+            cur.execute(sql('SELECT id FROM officers WHERE badge=?'),(req['badge'],))
+            if one_dict(cur):return 409,{'error':'That badge ID is already in use.'},{ }
+            cur.execute(sql('SELECT id FROM users WHERE username=?'),(req['username'],))
+            if one_dict(cur):return 409,{'error':'That username is already in use. Ask the Administrator to submit a new request.'},{ }
+            password=secrets.token_urlsafe(15);now=utcnow();cur.execute(sql("INSERT INTO users(username,password_hash,name,role,active,created_at) VALUES(?,?,?,'Operator',?,?)"),(req['username'],hash_password(password),req['name'],True,now));uid=cur.lastrowid
+            cur.execute(sql('INSERT INTO officers(name,role,badge,team_id,user_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?)'),(req['name'],req['role'],req['badge'],req['team_id'],uid,now,now));oid=cur.lastrowid
+            cur.execute(sql("UPDATE officer_requests SET status='Approved',reviewed_by=? WHERE id=?"),(user['id'],ident));activity(c,'approved','officer_request',ident,f'Team member request approved; officer {oid} created',user['username']);c.commit()
+            return 200,{'status':'Approved','item':{'id':oid,'name':req['name'],'username':req['username'],'temporary_password':password}},{ }
+        except Exception:c.rollback();raise
         finally:c.close()
     def officer_detail(self,m,ident,b,user):
         c=connect()
         try:
-            cur=c.cursor();cur.execute(sql('SELECT id FROM officers WHERE id=?'),(ident,));o=one_dict(cur)
+            cur=c.cursor();cur.execute(sql('SELECT id,user_id FROM officers WHERE id=?'),(ident,));o=one_dict(cur)
             if not o:return 404,{'error':'Team member was not found.'},{}
             if m=='GET':cur.execute(sql('SELECT o.id,o.name,o.role,o.badge,(SELECT COUNT(*) FROM cases c WHERE c.officer_id=o.id) cases FROM officers o WHERE id=?'),(o['id'],));return 200,{'item':one_dict(cur)},{}
             denied=authorize(user,True)
             if denied:return denied[0],denied[1],{}
-            if m=='DELETE':cur.execute(sql('SELECT COUNT(*) n FROM cases WHERE officer_id=?'),(o['id'],));
+            if m=='DELETE':cur.execute(sql('SELECT COUNT(*) n FROM cases WHERE officer_id=? OR id IN (SELECT case_id FROM case_members WHERE officer_id=?)'),(o['id'],o['id']));
             if m=='DELETE' and one_dict(cur)['n']:return 409,{'error':'This team member is assigned to cases. Reassign those cases before deleting.'},{}
-            if m=='DELETE':cur.execute(sql('DELETE FROM officers WHERE id=?'),(o['id'],));activity(c,'deleted','officer',ident,'Team member deleted',user['username']);c.commit();return 200,{'ok':True},{}
+            if m=='DELETE':
+                cur.execute(sql('DELETE FROM officers WHERE id=?'),(o['id'],))
+                if o['user_id']:
+                    cur.execute(sql('DELETE FROM users WHERE id=? AND role=?'),(o['user_id'],'Operator'))
+                activity(c,'deleted','officer',ident,'Team member deleted',user['username']);c.commit();return 200,{'ok':True},{}
             if m=='PUT':
-                d={k:clean_text(b,k,label,maxlen) for k,label,maxlen in [('name','Name',160),('role','Role',120),('badge','Badge ID',80)]};cur.execute(sql('UPDATE officers SET name=?,role=?,badge=?,updated_at=? WHERE id=?'),(d['name'],d['role'],d['badge'],utcnow(),o['id']));activity(c,'updated','officer',ident,'Team member updated',user['username']);c.commit();cur.execute(sql('SELECT o.id,o.name,o.role,o.badge,(SELECT COUNT(*) FROM cases c WHERE c.officer_id=o.id) cases FROM officers o WHERE id=?'),(o['id'],));return 200,{'item':one_dict(cur)},{}
+                d={k:clean_text(b,k,label,maxlen) for k,label,maxlen in [('name','Name',160),('role','Role',120),('badge','Badge ID',80)]};team_id=int(b['team_id']) if b.get('team_id') else None;cur.execute(sql('UPDATE officers SET name=?,role=?,badge=?,team_id=?,updated_at=? WHERE id=?'),(d['name'],d['role'],d['badge'],team_id,utcnow(),o['id']));activity(c,'updated','officer',ident,'Team member updated',user['username']);c.commit();cur.execute(sql('SELECT o.id,o.name,o.role,o.badge,o.team_id,t.name team_name,u.id user_id,u.username,u.active account_active,(SELECT COUNT(*) FROM case_members cm WHERE cm.officer_id=o.id) cases FROM officers o LEFT JOIN teams t ON t.id=o.team_id LEFT JOIN users u ON u.id=o.user_id WHERE o.id=?'),(o['id'],));return 200,{'item':one_dict(cur)},{}
+            return 405,{'error':'Method not allowed.'},{}
+        except Exception:c.rollback();raise
+        finally:c.close()
+    def list_teams(self):
+        c=connect()
+        try:
+            cur=c.cursor();cur.execute('SELECT t.id,t.name,t.description,COUNT(DISTINCT o.id) member_count,COUNT(DISTINCT ct.case_id) case_count FROM teams t LEFT JOIN officers o ON o.team_id=t.id LEFT JOIN case_teams ct ON ct.team_id=t.id GROUP BY t.id,t.name,t.description ORDER BY t.name');return 200,{'items':cursor_dicts(cur)},{}
+        finally:c.close()
+    def create_team(self,b,user):
+        denied=authorize(user,True)
+        if denied:return denied[0],denied[1],{}
+        name=clean_text(b,'name','Team name',160);description=clean_text(b,'description','Description',500,False);c=connect()
+        try:
+            cur=c.cursor();now=utcnow();cur.execute(sql('INSERT INTO teams(name,description,created_at,updated_at) VALUES(?,?,?,?)'),(name,description or None,now,now));tid=cur.lastrowid;activity(c,'created','team',tid,f'Team created: {name}',user['username']);c.commit();return 201,{'item':{'id':tid,'name':name,'description':description,'member_count':0}},{}
+        except Exception:c.rollback();raise
+        finally:c.close()
+    def team_detail(self,m,ident,b,user):
+        c=connect()
+        try:
+            cur=c.cursor();cur.execute(sql('SELECT id,name,description FROM teams WHERE id=?'),(ident,));team=one_dict(cur)
+            if not team:return 404,{'error':'Team was not found.'},{}
+            if m=='GET':
+                cur.execute(sql('SELECT o.id,o.name,o.role,o.badge,u.username,u.active account_active FROM officers o LEFT JOIN users u ON u.id=o.user_id WHERE o.team_id=? ORDER BY o.name'),(team['id'],));team['members']=cursor_dicts(cur);return 200,{'item':team},{}
+            denied=authorize(user,True)
+            if denied:return denied[0],denied[1],{}
+            if m=='PUT':
+                name=clean_text(b,'name','Team name',160);description=clean_text(b,'description','Description',500,False);cur.execute(sql('UPDATE teams SET name=?,description=?,updated_at=? WHERE id=?'),(name,description or None,utcnow(),team['id']));activity(c,'updated','team',ident,f'Team updated: {name}',user['username']);c.commit();return 200,{'item':{'id':team['id'],'name':name,'description':description}},{}
+            if m=='DELETE':
+                cur.execute(sql('SELECT COUNT(*) n FROM case_teams WHERE team_id=?'),(team['id'],))
+                if one_dict(cur)['n']:return 409,{'error':'Remove this team from assigned cases before deleting it.'},{}
+                cur.execute(sql('DELETE FROM teams WHERE id=?'),(team['id'],));activity(c,'deleted','team',ident,f'Team deleted: {team["name"]}',user['username']);c.commit();return 200,{'ok':True},{}
             return 405,{'error':'Method not allowed.'},{}
         except Exception:c.rollback();raise
         finally:c.close()
@@ -966,7 +1203,7 @@ class API(BaseHTTPRequestHandler):
                 for item in cursor_dicts(cur):
                     person=self.person_item(c,item['id']);rows.append({'id':person['id'],'name':person['name'],'related_cases':'; '.join(f"{link['case_reference']} ({link['role']})" for link in person['cases']),'age':person['age'],'status':person['status'],'charge':person['charge']})
             elif kind=='officers':cur.execute('SELECT name,role,badge,(SELECT COUNT(*) FROM cases c WHERE c.officer_id=o.id) assigned_cases FROM officers o ORDER BY name')
-            else:cur.execute('SELECT case_ref case_reference,title,category,status,officer_name officer,opened_on date,location FROM case_view ORDER BY created_at DESC')
+            else:cur.execute('SELECT case_ref case_reference,title,category,status,officer_name officer,opened_on date,location FROM case_view ORDER BY id DESC')
             if kind not in ('aging','analytics-officers','analytics-monthly','analytics-hotspots'):rows=cursor_dicts(cur)
             buf=__import__('io').StringIO();writer=csv.DictWriter(buf,fieldnames=list(rows[0].keys()) if rows else ['No records']);writer.writeheader();writer.writerows(rows) if rows else None;return 200,buf.getvalue().encode('utf-8-sig'),{'Content-Type':'text/csv; charset=utf-8','Content-Disposition':f'attachment; filename="casework-{kind}.csv"'}
         finally:c.close()
@@ -976,11 +1213,10 @@ def install_views():
     c=connect()
     try:
         cur=c.cursor()
-        for name in ('repeat_persons_view','officer_workload_view','public_case_view','case_view'):cur.execute(f'DROP VIEW IF EXISTS {name}')
+        cur.execute('DROP VIEW IF EXISTS repeat_persons_view')
+        for name in ('officer_workload_view','case_view'):cur.execute(f'DROP VIEW IF EXISTS {name}')
         cur.execute('CREATE VIEW case_view AS SELECT c.id,c.case_ref,c.title,c.category,c.status,c.officer_id,o.name officer_name,c.opened_on,c.location,c.resolution,c.created_at,c.updated_at FROM cases c LEFT JOIN officers o ON o.id=c.officer_id')
         cur.execute('''CREATE VIEW officer_workload_view AS SELECT o.id officer_id,o.name officer_name,o.role,o.badge,COUNT(c.id) total_cases,COALESCE(SUM(CASE WHEN c.status='Closed' THEN 1 ELSE 0 END),0) closed_cases,COALESCE(SUM(CASE WHEN c.id IS NOT NULL AND c.status<>'Closed' THEN 1 ELSE 0 END),0) open_cases FROM officers o LEFT JOIN cases c ON c.officer_id=o.id GROUP BY o.id,o.name,o.role,o.badge''')
-        cur.execute('''CREATE VIEW repeat_persons_view AS SELECT p.id person_id,p.name,p.status,p.charge,COUNT(DISTINCT cp.case_reference) case_count FROM persons p JOIN case_persons cp ON cp.person_id=p.id GROUP BY p.id,p.name,p.status,p.charge HAVING COUNT(DISTINCT cp.case_reference)>1''')
-        cur.execute('''CREATE VIEW public_case_view AS SELECT case_ref,title,category,status,opened_on,location FROM cases''')
         c.commit()
     finally:c.close()
 def create_user_from_env():
@@ -999,12 +1235,12 @@ def seed_sample():
     try:
         cur=c.cursor();cur.execute('SELECT COUNT(*) n FROM cases');
         if one_dict(cur)['n']:raise RuntimeError('Sample data is only added to an empty cases table.')
-        now=utcnow();officers=[('Maya Thompson','Senior Detective','DEMO-1042'),('Arjun Patel','Investigation Officer','DEMO-1087'),('Jordan Chen','Detective','DEMO-1136')]
+        year=date.today().year;now=utcnow();officers=[('Maya Thompson','Senior Detective','DEMO-1042'),('Arjun Patel','Investigation Officer','DEMO-1087'),('Jordan Chen','Detective','DEMO-1136')]
         for name,role,badge in officers:cur.execute(sql('INSERT INTO officers(name,role,badge,created_at,updated_at) VALUES(?,?,?,?,?)'),(name,role,badge,now,now))
         cur.execute('SELECT id,name FROM officers');ids={r['name']:r['id'] for r in cursor_dicts(cur)}
-        cases=[('DEMO-2026-001','Riverside warehouse report','Burglary','Active','Maya Thompson','Riverside'),('DEMO-2026-002','Central district fraud report','Fraud','Under review','Arjun Patel','Central District'),('DEMO-2026-003','Market street incident','Assault','Pending','Jordan Chen','Market Street')]
+        cases=[(f'CASE-{year}-001','Riverside warehouse report','Burglary','Active','Maya Thompson','Riverside'),(f'CASE-{year}-002','Central district fraud report','Fraud','Under review','Arjun Patel','Central District'),(f'CASE-{year}-003','Market street incident','Assault','Pending','Jordan Chen','Market Street')]
         for ref,title,cat,status,officer,location in cases:cur.execute(sql('INSERT INTO cases(case_ref,title,category,status,officer_id,opened_on,location,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)'),(ref,title,cat,status,ids[officer],date.today().isoformat(),location,now,now))
-        cur.execute(sql('SELECT id,case_ref FROM cases WHERE case_ref=?'),('DEMO-2026-001',));linked=one_dict(cur);cur.execute(sql('INSERT INTO persons(name,case_id,age,status,charge,created_at,updated_at) VALUES(?,?,?,?,?,?,?)'),('Taylor Reed',linked['id'],34,'Under investigation','Breaking and entering',now,now));person_id=cur.lastrowid;cur.execute(sql("INSERT INTO case_persons(case_reference,person_id,role,added_at) VALUES(?,?,?,?)"),(linked['case_ref'],person_id,'person_of_interest',now));c.commit()
+        cur.execute(sql('SELECT id,case_ref FROM cases WHERE case_ref=?'),(f'CASE-{year}-001',));linked=one_dict(cur);cur.execute(sql('INSERT INTO persons(name,case_id,age,status,charge,created_at,updated_at) VALUES(?,?,?,?,?,?,?)'),('Taylor Reed',linked['id'],34,'Under investigation','Breaking and entering',now,now));person_id=cur.lastrowid;cur.execute(sql("INSERT INTO case_persons(case_reference,person_id,role,added_at) VALUES(?,?,?,?)"),(linked['case_ref'],person_id,'person_of_interest',now));c.commit()
     finally:c.close()
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--create-user',action='store_true',help='Create a user from CASEWORK_NEW_* environment variables');parser.add_argument('--seed-sample',action='store_true',help='Add fictional examples to an empty database');args=parser.parse_args();init_db();install_views()

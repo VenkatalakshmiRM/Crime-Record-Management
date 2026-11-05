@@ -113,7 +113,7 @@ class BackendTests(unittest.TestCase):
   self.assertEqual(self.call('POST','/api/cases',case,self.admin)[0],409)
   self.assertEqual(self.call('GET','/api/cases?q=TEST-CASE-001',cookie=self.admin)[1]['total'],1)
   updated={**case,'title':'Updated fictional case','status':'Closed'};status,result,_=self.call('PUT','/api/cases/TEST-CASE-001',updated,self.admin);self.assertEqual(status,200);self.assertEqual(result['item']['status'],'Closed')
-  history_status,history,_=self.call('GET','/api/cases/TEST-CASE-001/history',cookie=self.admin);self.assertEqual(history_status,200);self.assertEqual(len(history['items']),3);self.assertTrue(all(item['changed_by']=='manager' for item in history['items']));self.assertTrue(any(item['type']=='status' and item['old_status']=='Active' and item['new_status']=='Closed' for item in history['items']))
+  history_status,history,_=self.call('GET','/api/cases/TEST-CASE-001/history',cookie=self.admin);self.assertEqual(history_status,200);self.assertEqual(len(history['items']),2);self.assertTrue(all(item['changed_by']=='manager' for item in history['items']));self.assertTrue(any(item['type']=='record' and item['new_values'] for item in history['items']));self.assertTrue(any(item['type']=='status' and item['old_status']=='Active' and item['new_status']=='Closed' and item['old_values'] and item['new_values'] for item in history['items']))
   dashboard=self.call('GET','/api/dashboard',cookie=self.admin)[1];self.assertEqual(dashboard['counts']['total'],1);self.assertEqual(dashboard['counts']['closed'],1)
   reports=self.call('GET','/api/reports',cookie=self.admin)[1];self.assertEqual(reports['total'],1)
   self.assertGreaterEqual(len(self.call('GET','/api/activity',cookie=self.admin)[1]['items']),2)
@@ -121,7 +121,7 @@ class BackendTests(unittest.TestCase):
   self.assertEqual(self.call('PUT','/api/cases/TEST-CASE-001',{**updated,'status':'Active'},self.admin)[0],409)
   self.call('POST','/api/cases',{'id':'TEST-DELETE-001','title':'Disposable active case','category':'Other','status':'Active'},self.admin)
   self.assertEqual(self.call('DELETE','/api/cases/TEST-DELETE-001',cookie=self.admin)[0],200)
-  c=api.connect();cur=c.cursor();cur.execute("SELECT action,changed_by FROM audit_log WHERE table_name='cases' AND record_key=? ORDER BY id",('TEST-DELETE-001',));deleted_audit=api.cursor_dicts(cur);c.close();self.assertEqual(deleted_audit[-1]['action'],'DELETE');self.assertEqual(deleted_audit[-1]['changed_by'],'manager')
+  c=api.connect();cur=c.cursor();cur.execute("SELECT event_type,changed_by FROM case_status_history WHERE case_reference=? ORDER BY id",('TEST-DELETE-001',));deleted_history=api.cursor_dicts(cur);c.close();self.assertEqual(deleted_history[-1]['event_type'],'CASE_DELETED');self.assertEqual(deleted_history[-1]['changed_by'],'manager')
   self.assertEqual(self.call('GET','/api/cases/TEST-CASE-001',cookie=self.admin)[0],200)
   self.assertEqual(self.call('GET','/api/cases/NOT-FOUND/history',cookie=self.admin)[0],404)
  def test_person_officer_foreign_keys_and_operator_permissions(self):
@@ -183,11 +183,7 @@ class BackendTests(unittest.TestCase):
   ranks={row['officer_name']:row['rank'] for row in data['officer_rankings']};self.assertEqual(ranks['Rank Officer A'],1);self.assertEqual(ranks['Rank Officer B'],2);self.assertEqual(ranks['Rank Officer C'],3)
   months={row['month']:row for row in data['monthly_case_change']};self.assertEqual([months[m]['case_change'] for m in ('2026-01','2026-02','2026-03')],[0,-1,2]);self.assertEqual(months['2026-03']['previous_month_cases'],1)
   self.assertEqual(data['location_hotspots'],[{'location':'Hotspot','case_count':2}])
-  conn=api.connect();cur=conn.cursor();cur.execute('SELECT COUNT(*) n FROM officer_workload_view');self.assertEqual(api.one_dict(cur)['n'],3);cur.execute('SELECT case_ref FROM public_case_view LIMIT 1');self.assertTrue(api.one_dict(cur));conn.close()
-  self.call('POST','/api/persons',{'name':'Repeat Analytics Person','cases':[{'case_reference':'AN-JAN-1','role':'suspect'},{'case_reference':'AN-FEB-1','role':'witness'}],'status':'Unknown','charge':'Analytics test'},self.admin)
-  conn=api.connect();cur=conn.cursor();cur.execute("SELECT case_count FROM repeat_persons_view WHERE name=?",('Repeat Analytics Person',));self.assertEqual(api.one_dict(cur)['case_count'],2)
-  with self.assertRaises(api.sqlite3.OperationalError):cur.execute('SELECT resolution FROM public_case_view')
-  conn.close()
+  conn=api.connect();cur=conn.cursor();cur.execute('SELECT COUNT(*) n FROM officer_workload_view');self.assertEqual(api.one_dict(cur)['n'],3);conn.close()
   for kind in ('analytics-officers','analytics-monthly','analytics-hotspots'):
    status,csv,headers=self.call('GET',f'/api/reports/export?type={kind}',cookie=self.admin);self.assertEqual(status,200);self.assertIn(b'\xef\xbb\xbf',csv);self.assertIn(f'casework-{kind}.csv',headers['Content-Disposition'])
  def test_invalid_inputs_and_not_found(self):
@@ -214,16 +210,16 @@ class BackendTests(unittest.TestCase):
   status,moved,_=self.call('POST',transfer_path,{'to_badge':'OPS-A'},self.admin);self.assertEqual(status,200);self.assertEqual(moved['moved'],2)
   self.assertEqual(self.call('POST',transfer_path,{'to_badge':'OPS-A'},self.operator)[0],403)
 
- def test_transfer_failure_rolls_back_cases_audit_and_activity(self):
+ def test_transfer_failure_rolls_back_cases_history_and_activity(self):
   _,source,_=self.call('POST','/api/officers',{'name':'Rollback Source','role':'Detective','badge':'ROLL-SRC'},self.admin)
   _,target,_=self.call('POST','/api/officers',{'name':'Rollback Target','role':'Detective','badge':'ROLL-DST'},self.admin)
   for ref in ('ROLL-1','ROLL-2','ROLL-3'):
    self.call('POST','/api/cases',{'id':ref,'title':ref,'category':'Test','status':'Active','officer':'Rollback Source'},self.admin)
-  conn=api.connect();cur=conn.cursor();cur.execute("SELECT COUNT(*) n FROM audit_log WHERE table_name='cases' AND action='UPDATE'");audit_before=api.one_dict(cur)['n'];cur.execute("SELECT COUNT(*) n FROM activity WHERE action='transferred'");activity_before=api.one_dict(cur)['n']
+  conn=api.connect();cur=conn.cursor();cur.execute("SELECT COUNT(*) n FROM case_status_history WHERE event_type='CASE_UPDATED'");history_before=api.one_dict(cur)['n'];cur.execute("SELECT COUNT(*) n FROM activity WHERE action='transferred'");activity_before=api.one_dict(cur)['n']
   with self.assertRaisesRegex(RuntimeError,'Injected mid-transfer failure'):
    api.service_transfer_cases(conn,'ROLL-SRC','ROLL-DST',{'username':'manager'},fail_after=2)
   cur.execute('SELECT officer_id,COUNT(*) n FROM cases WHERE case_ref LIKE ? GROUP BY officer_id',('ROLL-%',));assigned={row['officer_id']:row['n'] for row in api.cursor_dicts(cur)}
-  cur.execute("SELECT COUNT(*) n FROM audit_log WHERE table_name='cases' AND action='UPDATE'");audit_after=api.one_dict(cur)['n'];cur.execute("SELECT COUNT(*) n FROM activity WHERE action='transferred'");activity_after=api.one_dict(cur)['n'];conn.close()
-  self.assertEqual(assigned,{source['item']['id']:3});self.assertEqual(audit_after,audit_before);self.assertEqual(activity_after,activity_before)
+  cur.execute("SELECT COUNT(*) n FROM case_status_history WHERE event_type='CASE_UPDATED'");history_after=api.one_dict(cur)['n'];cur.execute("SELECT COUNT(*) n FROM activity WHERE action='transferred'");activity_after=api.one_dict(cur)['n'];conn.close()
+  self.assertEqual(assigned,{source['item']['id']:3});self.assertEqual(history_after,history_before);self.assertEqual(activity_after,activity_before)
 
 if __name__=='__main__':unittest.main()

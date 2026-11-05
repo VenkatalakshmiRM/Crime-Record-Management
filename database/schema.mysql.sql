@@ -24,13 +24,13 @@ CREATE TABLE IF NOT EXISTS officers (
 
 CREATE TABLE IF NOT EXISTS cases (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  case_ref VARCHAR(80) NOT NULL UNIQUE,
+  case_ref VARCHAR(80) NOT NULL UNIQUE CHECK (REGEXP_LIKE(case_ref, '^CASE-[0-9]{4}-[0-9]{3}$')),
   title VARCHAR(240) NOT NULL,
   category VARCHAR(100) NOT NULL,
   status ENUM('Active','Under review','Pending','Closed') NOT NULL,
   officer_id BIGINT UNSIGNED NULL,
-  opened_on DATE NULL,
-  location VARCHAR(240) NOT NULL DEFAULT '',
+  opened_on DATE NOT NULL,
+  location VARCHAR(240) NOT NULL,
   resolution TEXT NULL,
   created_at VARCHAR(40) NOT NULL,
   updated_at VARCHAR(40) NOT NULL,
@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS persons (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
   name VARCHAR(160) NOT NULL,
   case_id BIGINT UNSIGNED NULL,
-  age SMALLINT UNSIGNED NULL,
+  age SMALLINT UNSIGNED NULL CHECK (age IS NULL OR age <= 120),
   status ENUM('Under investigation','In custody','Released on bail','Wanted','Unknown') NOT NULL,
   charge VARCHAR(240) NOT NULL,
   created_at VARCHAR(40) NOT NULL,
@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS evidence (
   case_reference VARCHAR(80) NOT NULL,
   description TEXT NOT NULL,
   `type` VARCHAR(80) NOT NULL,
-  hash CHAR(64) NOT NULL,
+  hash CHAR(64) NOT NULL CHECK (REGEXP_LIKE(hash, '^[0-9A-Fa-f]{64}$')),
   storage_path VARCHAR(500) NOT NULL,
   collected_by BIGINT UNSIGNED NOT NULL,
   collected_at VARCHAR(40) NOT NULL,
@@ -152,58 +152,33 @@ SELECT c.id,c.case_ref,c.title,c.category,c.status,c.officer_id,o.name AS office
        c.opened_on,c.location,c.resolution,c.created_at,c.updated_at
 FROM cases c LEFT JOIN officers o ON o.id=c.officer_id;
 
-CREATE TABLE IF NOT EXISTS audit_log (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  table_name VARCHAR(64) NOT NULL,
-  record_key VARCHAR(80) NOT NULL,
-  action VARCHAR(10) NOT NULL,
-  old_values JSON NULL,
-  new_values JSON NULL,
-  changed_by VARCHAR(80) NULL,
-  changed_at VARCHAR(40) NOT NULL,
-  INDEX idx_audit_record(table_name,record_key,id)
-) ENGINE=InnoDB;
-
 CREATE TABLE IF NOT EXISTS case_status_history (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
   case_reference VARCHAR(80) NOT NULL,
+  event_type VARCHAR(24) NOT NULL DEFAULT 'STATUS_CHANGED',
   old_status VARCHAR(40) NULL,
   new_status VARCHAR(40) NULL,
+  old_values JSON NULL,
+  new_values JSON NULL,
   changed_by VARCHAR(80) NULL,
   changed_at VARCHAR(40) NOT NULL,
   INDEX idx_case_status_history_ref(case_reference,id)
 ) ENGINE=InnoDB;
 
 DELIMITER $$
-CREATE TRIGGER cases_audit_insert AFTER INSERT ON cases FOR EACH ROW
+CREATE TRIGGER cases_history_insert AFTER INSERT ON cases FOR EACH ROW
+  INSERT INTO case_status_history(case_reference,event_type,new_values,changed_by,changed_at)
+  VALUES(NEW.case_ref,'CASE_CREATED',JSON_OBJECT('case_ref',NEW.case_ref,'title',NEW.title,'category',NEW.category,'status',NEW.status,'officer_id',NEW.officer_id,'opened_on',NEW.opened_on,'location',NEW.location,'resolution',NEW.resolution),@app_user,DATE_FORMAT(UTC_TIMESTAMP(6),'%Y-%m-%dT%H:%i:%s.%fZ'))$$
+CREATE TRIGGER cases_history_update AFTER UPDATE ON cases FOR EACH ROW
 BEGIN
-  INSERT INTO audit_log(table_name,record_key,action,old_values,new_values,changed_by,changed_at)
-  VALUES('cases',NEW.case_ref,'INSERT',NULL,
-    JSON_OBJECT('case_ref',NEW.case_ref,'title',NEW.title,'category',NEW.category,'status',NEW.status,'officer_id',NEW.officer_id,'opened_on',NEW.opened_on,'location',NEW.location,'resolution',NEW.resolution),
-    @app_user,DATE_FORMAT(UTC_TIMESTAMP(6),'%Y-%m-%dT%H:%i:%s.%fZ'));
-END$$
-CREATE TRIGGER cases_audit_update AFTER UPDATE ON cases FOR EACH ROW
-BEGIN
-  INSERT INTO audit_log(table_name,record_key,action,old_values,new_values,changed_by,changed_at)
-  VALUES('cases',NEW.case_ref,'UPDATE',
-    JSON_OBJECT('case_ref',OLD.case_ref,'title',OLD.title,'category',OLD.category,'status',OLD.status,'officer_id',OLD.officer_id,'opened_on',OLD.opened_on,'location',OLD.location,'resolution',OLD.resolution),
-    JSON_OBJECT('case_ref',NEW.case_ref,'title',NEW.title,'category',NEW.category,'status',NEW.status,'officer_id',NEW.officer_id,'opened_on',NEW.opened_on,'location',NEW.location,'resolution',NEW.resolution),
-    @app_user,DATE_FORMAT(UTC_TIMESTAMP(6),'%Y-%m-%dT%H:%i:%s.%fZ'));
-END$$
-CREATE TRIGGER cases_audit_delete AFTER DELETE ON cases FOR EACH ROW
-BEGIN
-  INSERT INTO audit_log(table_name,record_key,action,old_values,new_values,changed_by,changed_at)
-  VALUES('cases',OLD.case_ref,'DELETE',
-    JSON_OBJECT('case_ref',OLD.case_ref,'title',OLD.title,'category',OLD.category,'status',OLD.status,'officer_id',OLD.officer_id,'opened_on',OLD.opened_on,'location',OLD.location,'resolution',OLD.resolution),
-    NULL,@app_user,DATE_FORMAT(UTC_TIMESTAMP(6),'%Y-%m-%dT%H:%i:%s.%fZ'));
-END$$
-CREATE TRIGGER cases_status_history_update AFTER UPDATE ON cases FOR EACH ROW
-BEGIN
-  IF NOT (OLD.status <=> NEW.status) THEN
-    INSERT INTO case_status_history(case_reference,old_status,new_status,changed_by,changed_at)
-    VALUES(NEW.case_ref,OLD.status,NEW.status,@app_user,DATE_FORMAT(UTC_TIMESTAMP(6),'%Y-%m-%dT%H:%i:%s.%fZ'));
+  IF NOT (OLD.case_ref <=> NEW.case_ref) OR NOT (OLD.title <=> NEW.title) OR NOT (OLD.category <=> NEW.category) OR NOT (OLD.status <=> NEW.status) OR NOT (OLD.officer_id <=> NEW.officer_id) OR NOT (OLD.opened_on <=> NEW.opened_on) OR NOT (OLD.location <=> NEW.location) OR NOT (OLD.resolution <=> NEW.resolution) THEN
+    INSERT INTO case_status_history(case_reference,event_type,old_status,new_status,old_values,new_values,changed_by,changed_at)
+    VALUES(NEW.case_ref,IF(NOT (OLD.status <=> NEW.status),'STATUS_CHANGED','CASE_UPDATED'),IF(NOT (OLD.status <=> NEW.status),OLD.status,NULL),IF(NOT (OLD.status <=> NEW.status),NEW.status,NULL),JSON_OBJECT('case_ref',OLD.case_ref,'title',OLD.title,'category',OLD.category,'status',OLD.status,'officer_id',OLD.officer_id,'opened_on',OLD.opened_on,'location',OLD.location,'resolution',OLD.resolution),JSON_OBJECT('case_ref',NEW.case_ref,'title',NEW.title,'category',NEW.category,'status',NEW.status,'officer_id',NEW.officer_id,'opened_on',NEW.opened_on,'location',NEW.location,'resolution',NEW.resolution),@app_user,DATE_FORMAT(UTC_TIMESTAMP(6),'%Y-%m-%dT%H:%i:%s.%fZ'));
   END IF;
 END$$
+CREATE TRIGGER cases_history_delete AFTER DELETE ON cases FOR EACH ROW
+  INSERT INTO case_status_history(case_reference,event_type,old_values,changed_by,changed_at)
+  VALUES(OLD.case_ref,'CASE_DELETED',JSON_OBJECT('case_ref',OLD.case_ref,'title',OLD.title,'category',OLD.category,'status',OLD.status,'officer_id',OLD.officer_id,'opened_on',OLD.opened_on,'location',OLD.location,'resolution',OLD.resolution),@app_user,DATE_FORMAT(UTC_TIMESTAMP(6),'%Y-%m-%dT%H:%i:%s.%fZ'))$$
 CREATE TRIGGER cases_block_closed_delete BEFORE DELETE ON cases FOR EACH ROW
 BEGIN
   IF OLD.status='Closed' THEN
@@ -296,17 +271,6 @@ SELECT o.id AS officer_id,o.name AS officer_name,o.role,o.badge,
        COALESCE(SUM(CASE WHEN c.id IS NOT NULL AND c.status<>'Closed' THEN 1 ELSE 0 END),0) AS open_cases
 FROM officers o LEFT JOIN cases c ON c.officer_id=o.id
 GROUP BY o.id,o.name,o.role,o.badge;
-
-CREATE OR REPLACE VIEW repeat_persons_view AS
-SELECT p.id AS person_id,p.name,p.status,p.charge,
-       COUNT(DISTINCT cp.case_reference) AS case_count
-FROM persons p JOIN case_persons cp ON cp.person_id=p.id
-GROUP BY p.id,p.name,p.status,p.charge
-HAVING COUNT(DISTINCT cp.case_reference)>1;
-
--- Exposes operational case fields while omitting resolution and internal IDs.
-CREATE OR REPLACE SQL SECURITY INVOKER VIEW public_case_view AS
-SELECT case_ref,title,category,status,opened_on,location FROM cases;
 
 -- Custody history is append-only even for direct SQL callers.
 DROP TRIGGER IF EXISTS custody_log_no_update;

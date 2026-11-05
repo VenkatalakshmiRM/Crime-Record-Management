@@ -151,31 +151,19 @@ Indexes: `idx_sessions_expiry(expires_at)`, `idx_sessions_user_id(user_id)`.
 
 Indexes: `idx_login_attempts_username_time(username_key,attempted_at)`, `idx_login_attempts_ip_time(ip_key,attempted_at)`. Five failed attempts lock a matching account or IP for 15 minutes.
 
-### `audit_log`
-
-| Column | MySQL type | Constraints / meaning |
-|---|---|---|
-| `id` | BIGINT UNSIGNED | PK, AUTO_INCREMENT |
-| `table_name` | VARCHAR(64) | NN; source table name |
-| `record_key` | VARCHAR(80) | NN; case reference for case audit rows |
-| `action` | VARCHAR(10) | NN; INSERT, UPDATE, or DELETE |
-| `old_values` | JSON | Nullable; prior case data for update/delete |
-| `new_values` | JSON | Nullable; resulting case data for insert/update |
-| `changed_by` | VARCHAR(80) | Nullable actor username from `@app_user` |
-| `changed_at` | VARCHAR(40) | NN; audit timestamp |
-
-Index: `idx_audit_record(table_name,record_key,id)`.
-
 ### `case_status_history`
 
 | Column | MySQL type | Constraints / meaning |
 |---|---|---|
 | `id` | BIGINT UNSIGNED | PK, AUTO_INCREMENT |
 | `case_reference` | VARCHAR(80) | NN; case reference retained in history |
-| `old_status` | VARCHAR(40) | Nullable prior status |
-| `new_status` | VARCHAR(40) | Nullable resulting status |
+| `event_type` | VARCHAR(24) | NN; `STATUS_CHANGED`, `CASE_CREATED`, `CASE_UPDATED`, or `CASE_DELETED` |
+| `old_status` | VARCHAR(40) | Nullable prior status, populated for status transitions |
+| `new_status` | VARCHAR(40) | Nullable resulting status, populated for status transitions |
+| `old_values` | JSON | Nullable snapshot of the case before the event |
+| `new_values` | JSON | Nullable snapshot after creation or update |
 | `changed_by` | VARCHAR(80) | Nullable actor username |
-| `changed_at` | VARCHAR(40) | NN; transition timestamp |
+| `changed_at` | VARCHAR(40) | NN; event timestamp |
 
 Index: `idx_case_status_history_ref(case_reference,id)`.
 
@@ -185,11 +173,9 @@ Index: `idx_case_status_history_ref(case_reference,id)`.
 |---|---|---|
 | `case_view` | `id`, `case_ref`, `title`, `category`, `status`, `officer_id`, `officer_name`, `opened_on`, `location`, `resolution`, `created_at`, `updated_at` | Cases LEFT JOIN officers by officer ID |
 | `officer_workload_view` | `officer_id`, `officer_name`, `role`, `badge`, `total_cases`, `closed_cases`, `open_cases` | Officer assignment counts aggregated from cases |
-| `repeat_persons_view` | `person_id`, `name`, `status`, `charge`, `case_count` | Person/case links grouped; only people linked to >1 distinct case |
-| `public_case_view` | `case_ref`, `title`, `category`, `status`, `opened_on`, `location` | Restricted projection omitting internal IDs and resolution |
 
 ## Triggers and stored routines
 
-The fresh MySQL schema defines `cases_audit_insert`, `cases_audit_update`, and `cases_audit_delete`; `cases_status_history_update`; `cases_block_closed_delete`; and `cases_reject_reopen`. It also defines `custody_log_no_update` and `custody_log_no_delete`. The procedures are `assign_officer(case_ref)`, `close_case(case_ref,resolution,user)`, and `transfer_officer_cases(from_badge,to_badge)`. The function is `days_open(case_ref) RETURNS INT`. These routines add no columns beyond those listed above.
+The fresh MySQL schema defines case-history triggers that write status transitions and case snapshots to `case_status_history`, plus `cases_block_closed_delete` and `cases_reject_reopen`. It also defines `custody_log_no_update` and `custody_log_no_delete`. The procedures are `assign_officer(case_ref)`, `close_case(case_ref,resolution,user)`, and `transfer_officer_cases(from_badge,to_badge)`. The function is `days_open(case_ref) RETURNS INT`. These routines add no columns beyond those listed above.
 
 Constraint and index names are listed by their owning table. The exact authoritative definitions, including engine, default values, foreign-key actions, and trigger bodies, are in `database/schema.mysql.sql`.

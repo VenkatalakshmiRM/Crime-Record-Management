@@ -10,7 +10,7 @@ CASEWORK is a browser-based criminal case management application backed by a Pyt
 - Management Head-only account listing, creation, role changes, enable/disable, and safeguards against self-disable or removing the last active Management Head. Administrators retain operational management access but cannot manage accounts; Operators are read-only.
 - Case, person, and team-member CRUD; many-to-many case/person links with relationship roles; filtering, dashboard counts, activity history, CSV reports, and Analytics page.
 - MySQL case audit and status-history triggers, closed-case deletion/reopen protections, transactional assignment/close/transfer routines, and SQLite-compatible Python services and triggers where the adapters differ.
-- Workload, repeat-person, case, and public projection views; window-function analytics using RANK and LAG; performance indexes and fictional dataset/explain scripts.
+- Workload, case, and public projection views; window-function analytics using RANK and LAG; performance indexes and fictional dataset/explain scripts.
 - Evidence records with SHA-256 fingerprint fields and append-only custody events, plus court hearing CRUD and upcoming dashboard events.
 - Optional MySQL direct database accounts for administrator, management, and SELECT-only operator access. The API itself currently uses one configured database service account.
 

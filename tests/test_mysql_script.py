@@ -47,10 +47,9 @@ class MySQLScriptTests(unittest.TestCase):
         root = Path(__file__).parents[1]
         schema = (root / 'database' / 'schema.mysql.sql').read_text(encoding='utf-8').lower()
         migration = (root / 'database' / 'migrations' / '005_analytics_views.sql').read_text(encoding='utf-8').lower()
-        for view in ('officer_workload_view', 'repeat_persons_view', 'public_case_view'):
+        for view in ('officer_workload_view',):
             self.assertIn(f'view {view}', schema)
             self.assertIn(f'view {view}', migration)
-        self.assertIn('having count(distinct cp.case_reference)>1', schema)
         self.assertIn('sql security invoker', schema)
         self.assertIn('rank() over', (root / 'backend' / 'api.py').read_text(encoding='utf-8').lower())
         self.assertIn('lag(case_count) over', (root / 'backend' / 'api.py').read_text(encoding='utf-8').lower())

@@ -75,6 +75,8 @@ mysql -u casework_app -p casework < database/migrations/003_routines_transaction
 
 Apply later numbered migrations in order when upgrading an existing database. Phase 6 adds the performance indexes in `database/migrations/006_performance_indexes.sql`; a fresh install uses `database/schema.mysql.sql` and already includes them.
 
+The API startup removes the retired `repeat_persons_view` from existing databases and no longer recreates it.
+
 Phase 7 adds evidence and custody tracking. For an existing installation, apply `database/migrations/007_evidence_custody.sql` after earlier migrations and restart the API. Fresh schema installs include these tables and append-only triggers.
 
 Phase 8 adds court hearings. Apply `database/migrations/008_court_hearings.sql` to an existing database after earlier migrations, or use the complete schema for a fresh install. Hearing records are managed per case at `/api/cases/{reference}/hearings`; the dashboard returns scheduled or adjourned hearings between today and 14 days ahead.
@@ -125,16 +127,19 @@ All data endpoints except health and login/logout require a valid server session
 | POST           | `/api/auth/change-password`           | Change the signed-in user's password and revoke their sessions               |
 | GET/POST       | `/api/users`                          | Management Head-only user list or account creation                           |
 | PUT            | `/api/users/{id}`                     | Management Head-only role or active-state change                             |
+| POST           | `/api/users/{id}/reset-password`       | Management Head-only one-time temporary password reset                       |
 | GET            | `/api/dashboard`                      | Database counts and five most recent cases                                   |
 | GET/POST       | `/api/cases`                          | Search/list (q,status,category,limit,offset) or create case                  |
 | GET/PUT/DELETE | `/api/cases/{case-reference}`         | Retrieve, update, or delete one case                                         |
 | GET            | `/api/cases/{case-reference}/history` | Retrieve record audit and status history timeline                            |
-| POST           | `/api/cases/{reference}/assign`       | Assign the least-loaded officer based on active cases                        |
+| POST           | `/api/cases/{reference}/assign`       | Assign one or more team members and/or whole teams                           |
 | POST           | `/api/cases/{reference}/close`        | Close a case and save its resolution atomically                              |
 | GET/POST       | `/api/persons`                        | Search/list or create person of interest                                     |
 | GET/PUT/DELETE | `/api/persons/{id}`                   | Retrieve, update, or delete person                                           |
 | GET/POST       | `/api/officers`                       | Search/list (q,role) or create team member                                   |
 | GET/PUT/DELETE | `/api/officers/{id}`                  | Retrieve, update, or delete team member                                      |
+| GET/POST       | `/api/teams`                           | List or create teams                                                         |
+| GET/PUT/DELETE | `/api/teams/{id}`                      | Retrieve, update, or delete a team                                           |
 | POST           | `/api/officers/{id}/transfer-cases`   | Atomically transfer all assignments to `{to_badge}`                          |
 | GET            | `/api/reports`                        | Counts, status summary, activity count, workload, locations                  |
 | GET            | `/api/reports/export?type=...`        | CSV: cases, summary, resolution, locations, activity, workload               |
@@ -154,6 +159,8 @@ Responses use JSON objects with `item`, `items`, `counts`, or `error` fields as 
 | Manage own account/change password                     |             Yes |           Yes |      Yes |
 
 The hierarchy is Management Head → Administrator → Operator. The Management Head has all application permissions, including user management. Administrators can manage cases, persons, team members, evidence, and hearings, but cannot manage accounts. Operators are read-only and cannot change cases, persons, team members, or accounts. The API enforces permissions even if a user bypasses the UI. New accounts require a 12-character password. A Management Head cannot disable or demote their own account or remove the final active Management Head.
+
+Each team member is linked to an individual CASEWORK account. Adding a member creates an Operator account and shows its generated temporary password once; the Management Head can reset a password later from User management. Existing directory members are placed in a General team during upgrade and linked to an unlinked Operator account with the same name when available; otherwise an Operator account is created with a random password. Cases can be assigned to multiple individual members and whole teams at once.
 
 If a database previously ran `database/migrations/010_application_roles_and_reports.sql`, apply `database/migrations/011_revert_application_roles.sql` before continuing. The API also maps the temporary role values back during startup; SQLite keeps existing users and password hashes, expires old sessions, and removes the temporary report table and officer link.
 
@@ -190,11 +197,11 @@ Backup refuses to overwrite an existing path and writes a single-transaction SQL
 - `users (1) ── (many) sessions`: deleting a user invalidates their sessions.
 - `activity` stores action, record type/reference, short description, actor username, and timestamp; a log row is inserted in the same transaction as each successful mutation.
 - `case_view` joins a case to its assigned officer name for lists, dashboard, and exports.
-- `officer_workload_view` summarizes total, closed, and open case counts per officer. `repeat_persons_view` lists people linked to more than one distinct case. `public_case_view` exposes basic case details while omitting internal IDs and resolution text.
+- `officer_workload_view` summarizes total, closed, and open case counts per officer.
 - The authenticated Analytics page calls `GET /api/analytics`: `RANK()` ranks officers by closed cases, `LAG()` compares monthly case counts, and location hotspots use `GROUP BY ... HAVING COUNT(*) >= 2`. The page provides a separate CSV download for each result. SQLite uses its `strftime` date expression and built-in window functions (SQLite 3.25+); MySQL uses `DATE_FORMAT` and the same window-function logic.
 - Evidence can be listed or created at `/api/cases/{reference}/evidence`; individual records support GET, PUT, and DELETE at `/api/evidence/{id}`, with custody transfer at `/api/evidence/{id}/transfer`. Evidence fingerprints are validated as 64-character SHA-256 hex and become immutable after collection. Custody transfers are append-only in both database adapters, and records with transfer history cannot be deleted. The UI stores a path and fingerprint; file upload/storage is not part of this application.
 - Court hearings support GET/POST at `/api/cases/{reference}/hearings` and GET/PUT/DELETE at `/api/hearings/{id}`. The dashboard's `upcoming_hearings` payload includes only Scheduled and Adjourned records dated from today through the next 14 days. Hearing writes require Administrator or Management Head access.
-- Triggers write case INSERT/UPDATE/DELETE snapshots to `audit_log`; status transitions are recorded in `case_status_history`. The API sets `@app_user` on each MySQL write connection so triggers record the authenticated username. SQLite uses equivalent triggers for local development and tests.
+- Triggers write case creation, field-change snapshots, deletions, and status transitions to `case_status_history`. The API sets `@app_user` on each MySQL write connection so triggers record the authenticated username. SQLite uses equivalent triggers for local development and tests. Migration `014_merge_audit_into_case_status_history.sql` preserves existing audit rows before removing the retired `audit_log` table.
 - Closed cases cannot be deleted or reopened through direct SQL or the API. The API returns HTTP 409 with a clear conflict message. Other status changes are allowed.
 - MySQL `assign_officer`, `close_case`, `transfer_officer_cases`, and `days_open` routines are created at startup. SQLite uses transactional Python services for the procedures and a compatible `days_open(case_ref)` SQL function. The reports endpoint includes `case_aging`, and the Reports page exports a Days Open CSV.
 - Assignment, close, and transfer endpoints require Administrator or Management Head. Operators receive HTTP 403. Close-case requests accept `{ "resolution": "..." }`; transfers accept `{ "to_badge": "..." }`.

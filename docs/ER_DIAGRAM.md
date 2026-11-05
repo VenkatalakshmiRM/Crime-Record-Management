@@ -99,21 +99,14 @@ erDiagram
         VARCHAR actor
         VARCHAR created_at
     }
-    AUDIT_LOG {
-        BIGINT id PK
-        VARCHAR table_name
-        VARCHAR record_key
-        VARCHAR action
-        JSON old_values
-        JSON new_values
-        VARCHAR changed_by
-        VARCHAR changed_at
-    }
     CASE_STATUS_HISTORY {
         BIGINT id PK
         VARCHAR case_reference
+        VARCHAR event_type
         VARCHAR old_status
         VARCHAR new_status
+        JSON old_values
+        JSON new_values
         VARCHAR changed_by
         VARCHAR changed_at
     }
@@ -131,7 +124,7 @@ erDiagram
     CASES ||--o{ HEARINGS : "scheduled for"
 ```
 
-`case_persons` is the normalized many-to-many link and allows one person to have several roles or case links. `persons.case_id` is a compatibility field and is not the canonical relationship. `activity.actor`, `audit_log`, and `case_status_history` keep audit references without foreign keys so history can remain available independently of a user or case row. `login_attempts` stores SHA-256 identifiers for usernames and IP addresses, not the raw values.
+`case_persons` is the normalized many-to-many link and allows one person to have several roles or case links. `persons.case_id` is a compatibility field and is not the canonical relationship. `activity.actor` and `case_status_history.changed_by` keep actor references without foreign keys so history can remain available independently of a user or case row. `case_status_history` stores status transitions plus case snapshots. `login_attempts` stores SHA-256 identifiers for usernames and IP addresses, not the raw values.
 
 ## Application role hierarchy
 
@@ -141,4 +134,4 @@ The `users.role` column contains the application role; the hierarchy is enforced
 2. **Administrator** — can manage cases, persons of interest, team members, evidence, and hearings, but cannot manage user accounts.
 3. **Operator** — read-only access to the application records; cannot change cases, persons, team members, or user accounts.
 
-The reporting views are not repeated as entities because they do not store rows: `case_view`, `officer_workload_view`, `repeat_persons_view`, and `public_case_view` are documented in [DATA_DICTIONARY.md](DATA_DICTIONARY.md).
+The reporting views are not repeated as entities because they do not store rows: `case_view` and `officer_workload_view` are documented in [DATA_DICTIONARY.md](DATA_DICTIONARY.md).
